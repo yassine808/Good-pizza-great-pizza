@@ -492,6 +492,14 @@ namespace GoodPizza
                                     : MB(b) + " MB";
         }
 
+        // The download question is phrased in GB, always. Size() would say
+        // "713 MB", which reads as a small number right up until it is 0.7 GB
+        // of someone's bandwidth; the ask needs the bigger unit to be honest.
+        static string Gb(long b)
+        {
+            return (b / 1073741824.0).ToString("0.00", CultureInfo.InvariantCulture) + " GB";
+        }
+
         static bool Fail(string cause) { _cause = cause; Log.Err(cause); return false; }
 
         static void Wait(int ms)
@@ -808,7 +816,9 @@ namespace GoodPizza
             sb.AppendLine("Microsoft no longer distributes it, so the launcher can download a community build:");
             sb.AppendLine();
             sb.AppendLine("  File:    " + a.Name);
-            sb.AppendLine("  Size:    " + (a.Size > 0 ? Size(a.Size) : "unknown (several GB)"));
+            // GB first, MB in brackets: he wants to know how many GB this is
+            // before committing to it; the MB figure stays for reference.
+            sb.AppendLine("  Size:    " + (a.Size > 0 ? Gb(a.Size) + " (" + Size(a.Size) + ")" : "unknown (several GB)"));
             sb.AppendLine("  Source:  " + a.Source);
             sb.AppendLine("  Install: " + Cfg.WsaRoot);
             if (a.Name.EndsWith(".7z", StringComparison.OrdinalIgnoreCase) && Find7z() == null)
@@ -846,6 +856,21 @@ namespace GoodPizza
             object v; return d.TryGetValue(k, out v) && v != null ? v.ToString() : "";
         }
 
+        // The OS lives in the release TAG ("Windows_10_2407.40000.4.0_LTS_8"),
+        // never in the asset name ("WSA_2407.40000.4.0_x64_Release-Nightly-
+        // GApps-13.0-NoAmazon.7z"). So AssetExclude cannot exclude Windows 10
+        // builds - its "Windows_10" pattern matches no asset - and the +30
+        // Win11 bonus applied to names never fires either. Today the Windows_11
+        // tags happen to sort above the Windows_10 ones, but that is ordering
+        // luck: this repo does publish Windows_10 releases, and a Win10-only WSA
+        // would not register on a Windows 11 PC.
+        static readonly Regex Win10Tag = new Regex(
+            @"(^|[^A-Za-z0-9])windows[\s_\-]*10([^0-9]|$)",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase, TimeSpan.FromSeconds(2));
+        static readonly Regex Win11Tag = new Regex(
+            @"(^|[^A-Za-z0-9])windows[\s_\-]*11([^0-9]|$)|(^|[^A-Za-z0-9])win[\s_\-]*11([^0-9]|$)",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase, TimeSpan.FromSeconds(2));
+
         static Asset Discover()
         {
             var url = "https://api.github.com/repos/" + Cfg.Repo + "/releases?per_page=20";
@@ -878,6 +903,15 @@ namespace GoodPizza
                 var rd = r as Dictionary<string, object>;
                 if (rd == null) continue;
                 object draft; if (rd.TryGetValue("draft", out draft) && draft is bool && (bool)draft) continue;
+
+                object tagObj;
+                var tag = rd.TryGetValue("tag_name", out tagObj) && tagObj != null ? tagObj.ToString() : "";
+                if (tag.Length > 0 && Win10Tag.IsMatch(tag))
+                {
+                    Log.Info("skipping Windows 10 release " + tag + " - this launcher targets Windows 11");
+                    continue;
+                }
+
                 object av; if (!rd.TryGetValue("assets", out av)) continue;
                 var assets = av as object[]; if (assets == null) continue;
 
@@ -894,7 +928,10 @@ namespace GoodPizza
                     if (!Regex.IsMatch(name, "MindTheGapps|OpenGApps|GApps", RegexOptions.IgnoreCase)) continue;
 
                     var score = 50;
-                    if (Regex.IsMatch(name, "Windows_?11|Win_?11", RegexOptions.IgnoreCase)) score += 30;
+                    // The tag is the authoritative OS signal; the name check is
+                    // kept for repos that do encode the OS in the filename.
+                    if (Win11Tag.IsMatch(tag) ||
+                        Regex.IsMatch(name, "Windows_?11|Win_?11", RegexOptions.IgnoreCase)) score += 30;
                     if (isZip) score += 20;                        // zip needs no extra tool
                     if (score <= bestScore) continue;
 

@@ -5,9 +5,26 @@ Windows 11 with a single double-click. The launcher owns the whole chain — Win
 subsystem check → WSA install → WSA boot → Google Play install → game launch — and
 stays **completely silent** unless something goes wrong.
 
-> **Status:** the WSA behaviour documented below is *reverse-engineered and verified on
-> a real machine* (15 Oct 2026). The launcher implementation is in progress; this repo
-> currently holds the design and the evidence behind it.
+> **Status:** released. [`v1.0.0`](https://github.com/yassine808/Good-pizza-great-pizza/releases/latest)
+> is a single ~300 KB exe that provisions a clean Windows 11 machine end to end. The WSA
+> behaviour documented below is *reverse-engineered and verified on a real machine*
+> (15 Oct 2026), including a clean-room run that started from an empty `C:\WSA`.
+
+---
+
+## Download
+
+Take `Good.Pizza.Great.Pizza.exe` from the
+[latest release](https://github.com/yassine808/Good-pizza-great-pizza/releases/latest),
+double-click it, and approve the UAC prompt. That is the whole install — it carries no
+installer, no runtime and no dependencies beyond stock Windows. The SHA-256 of each
+asset is printed on its release page.
+
+> **Antivirus.** The exe is not code-signed, and it downloads a subsystem, registers a
+> package and elevates itself — precisely the shape AV heuristics look for. Avast was
+> observed killing it within seconds in a freshly created folder while letting the same
+> binary run from a folder it had already scanned. If your AV blocks it, allow it or
+> add an exclusion for its folder.
 
 ---
 
@@ -59,7 +76,7 @@ one that fails.
 
 ```mermaid
 flowchart TD
-    A[User double-clicks<br/>GoodPizza.exe] --> B{Windows 11<br/>22000+?}
+    A[User double-clicks<br/>Good Pizza, Great Pizza.exe] --> B{Windows 11<br/>22000+?}
     B -- no --> E[LOG WINDOW<br/>names the blocker]
     B -- yes --> C{Virtualisation on?<br/>Hyper-V present?}
     C -- no --> E
@@ -94,9 +111,22 @@ flowchart TD
     style AA fill:#14532d,stroke:#86efac,color:#fff
 ```
 
-**Silent by default.** The launcher runs windowless. It only opens a log window when a
-check fails — and the window names *which* check failed and what to do about it. On
-success you never see it at all; it exits and the game keeps running.
+**Silent by default.** The launcher opens no main window. It only opens a log window
+when a check fails — and that window names *which* check failed and what to do about
+it. On success you never see it at all.
+
+While it works, its only presence is a **tray icon** whose status line tracks the
+current step: `downloading WSA - 334 of 713 MB - 11.1 MB/s`, `waiting for Google
+sign-in - 3 min`, `playing - the launcher exits with the game`. Its menu offers the log
+and an **Exit launcher** that cancels the run exactly like Ctrl+C.
+
+**It leaves when the game does.** After submitting the `wsa://` activation the launcher
+waits for the game window, then follows it and exits once it closes, so nothing of the
+launcher stays resident behind the game.
+
+**Downloads show their work.** The 713 MB WSA archive is the only transfer large enough
+to deserve a window: a progress dialog with the byte count, the percentage, the
+transfer rate and a rough ETA. Small tool downloads stay in the log.
 
 ---
 
@@ -290,6 +320,10 @@ The correlation is exact:
 A full crash dump is captured to `C:\WSAdumps\` via WER `LocalDumps` for further
 analysis of exactly which CRT call fails.
 
+> That analysis was overtaken by the clean-room result below: after a full teardown the
+> same machine provisions and boots normally, so the abort follows *leftover* state
+> rather than following a clean machine.
+
 ---
 
 ## Failure modes, in the order they bite
@@ -300,24 +334,31 @@ analysis of exactly which CRT call fails.
 | Registration refuses | `0x80073D28` | Packaged service needs admin | `requireAdministrator` manifest |
 | Dependency install fails | `0x80073D02` | Framework package in use by another app | Compare versions first; skip if ≥ minimum |
 | Launch does nothing, no VM | — | First-run consent dialog unanswered | Find dialog, UIA-invoke `Continue` |
-| Crash ~1 s after consent | `0xc0000409` | `userdata.2.vhdx` creation aborts | *Open — see below* |
+| Crash ~1 s after consent | `0xc0000409` | `userdata.2.vhdx` creation aborts on a half-provisioned tree | Move `C:\WSA` aside and re-provision from scratch — see below |
 | Game installs but won't start | — | PairIP: installer is not Play Store | Never sideload; open the Play page |
 | Textures render black | — | ASTC textures unsupported on some GPUs | Install the split APK (`require_split`) |
 
-### The open problem
+### What fixed it
 
-`userdata.2.vhdx` creation is the one step that does not succeed on a truly clean
-system, and it is the step a brand-new PC must pass. Three directions, in preference
-order:
+The crash above was reproduced twelve times on an image that had been registered,
+torn down and re-registered — in other words on *leftover* state. A clean-room run
+that started from an empty `C:\WSA`, with no WSA package, no `LocalCache` and no
+leftovers, went through every step and booted:
 
-1. **Find the failing CRT call** in the captured dump — most likely a path, permission
-   or encoding parameter. If it is environmental, the launcher can pre-create the
-   correct conditions.
-2. **Pre-seed a userdata image.** Ship a known-good `userdata.2.vhdx` and place it in
-   the package's `LocalCache` before the first boot, so WSA never has to create one.
-   Cost: ~5.7 GB, so it ships outside the repo.
-3. **Degrade honestly.** Detect the abort, name it in the log window, and tell the user
-   this machine cannot complete first-run WSA provisioning.
+| Clean-room step | Result |
+|---|---|
+| discovery → download → SHA-256 verify | 4.5 s, 11 MB/s |
+| extract → dependency check | 24 s, 313 files, 2.11 GB |
+| register → `Stopped`→`Running` | ok, `2407.40000.4.0` |
+| boot → first-run consent auto-clicked | 5.8 s |
+| Android window visible | 4 s after consent |
+
+So the abort is tied to a half-provisioned state, not to every clean machine. The
+launcher answers it with a non-destructive move-aside: an existing `C:\WSA` is renamed
+aside rather than deleted, the fresh extraction becomes the package, and the old copy
+is removed only once registration has succeeded. A retry therefore always starts from a
+consistent tree instead of a half-deleted one, and nothing is destroyed before its
+replacement is known to work.
 
 ---
 
@@ -348,7 +389,8 @@ Once the VM is up, the launcher:
    `debug.require_split=split_config.etc1_rgb8_group_hd.apk`, without which in-game
    textures render black. Developer mode being off means this usually cannot run, so it
    never blocks launch.
-6. launches the game and exits.
+6. launches the game through `wsa://`, waits for its window, and stays with it until it
+   closes — then exits.
 
 > **Why not detect the install from `LocalState`?** Because that cache lies. The
 > `.ico`/`.png` and even package directories are written Windows-side and survive a
@@ -368,15 +410,17 @@ own, all the way to launching the game. You never have to come back to it.
 ```
 Good-pizza-great-pizza/
 ├── README.md
-├── .gitignore                         dist/, payload/, *.log
+├── .gitignore                         dist/, payload/, _build/, *.log
 ├── docs/
 │   └── screenshots/
-│       └── first-run-consent.png    first-run gate, captured from the real dialog
+│       ├── first-run-consent.png      first-run gate, captured from the real dialog
+│       └── exe-icon-256.png           the icon the exe is built with
 ├── src/
-│   └── AppLauncher.cs                 the launcher (single file, C# 5, ~900 lines)
+│   └── AppLauncher.cs                 the launcher (single file, C# 5, ~2,000 lines)
 ├── payload/                           wsa.zip, split APKs  (gitignored — too big)
 └── tools/
-    ├── build.ps1                      compiles src/ -> dist/Good Pizza, Great Pizza.exe
+    ├── build.ps1                      compiles src/ -> dist\Good Pizza, Great Pizza.exe
+    ├── _build\AssemblyInfo.cs         generated per build, gitignored
     ├── app.manifest                   requireAdministrator + PerMonitorV2 DPI
     ├── make-icon.ps1                  7-size .ico from the Play Store asset
     ├── goodpizza.ico                  generated icon (build input, committed)
@@ -408,11 +452,19 @@ The launcher downloads WSA itself, so a copy of this repo does **not** need to c
 ## Building
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\build.ps1
+powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Version 1.0.0
 ```
 
-The compiler cannot write into the project folder directly, so the build lands in
-`%TEMP%\gp.exe` and is copied in from there.
+Output lands in `dist\Good Pizza, Great Pizza.exe` with the icon and the
+`requireAdministrator` manifest embedded. `-Version` stamps the assembly identity that
+every run prints in its log header — without it a released exe reports `0.0.0.0`, which
+makes bug reports unusable. The generated `AssemblyInfo.cs` goes to the already-ignored
+`_build\` folder.
+
+The compiler is the .NET Framework `csc` and the source stays C# 5, so the exe needs
+nothing beyond a stock Windows install — no runtime to ship, no `dotnet` to require.
+`dist\` is gitignored on purpose: the exe is published as a release asset, not as a
+committed binary.
 
 ---
 
@@ -421,9 +473,12 @@ The compiler cannot write into the project folder directly, so the build lands i
 | File | What it shows |
 |---|---|
 | [`first-run-consent.png`](docs/screenshots/first-run-consent.png) | The WSA first-run consent dialog — the gate that must be answered before any VM is created |
+| [`exe-icon-256.png`](docs/screenshots/exe-icon-256.png) | The icon embedded in the exe, taken from the Play Store asset |
 
-More will be added as the launcher comes up: the provisioning log window on failure, the
-Play Store page, and the game running.
+Still to capture: the download prompt, the progress window and the failure log window.
+Their wording is verified through UI Automation element names, which is the reliable
+channel across the elevation boundary — screen capture is not, for the DPI reason
+described above.
 
 ---
 

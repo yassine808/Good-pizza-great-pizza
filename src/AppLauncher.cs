@@ -260,6 +260,234 @@ namespace GoodPizza
         }
     }
 
+    // ------------------------------------------------------------ tray icon
+    // This exe opens no window, so during the long stretches where it is
+    // legitimately doing nothing the user can see - a 700 MB download, and a
+    // Google sign-in only the user can perform - it would otherwise look like
+    // nothing is running at all. The tray icon makes the wait visible: the
+    // tooltip tracks the current step, and the menu gives the user the two
+    // things they might want while waiting - read the log, or cancel.
+    // It runs on its own STA thread with its own message loop, because a
+    // NotifyIcon needs one and the main thread is busy running checks.
+    internal static class Tray
+    {
+        static readonly object L = new object();
+        static volatile string _status = "starting";
+        static NotifyIcon _icon;
+        static ContextMenuStrip _menu;
+        static ToolStripMenuItem _line;
+        static string _icoPath;
+
+        // Program installs this so the menu's "Exit launcher" can cancel the run
+        // the same way Ctrl+C does.
+        public static Action OnExit;
+
+        public static void Start()
+        {
+            var ready = new ManualResetEvent(false);
+            var t = new Thread(() =>
+            {
+                try
+                {
+                    _menu = new ContextMenuStrip();
+                    _line = new ToolStripMenuItem("starting") { Enabled = false };
+                    _menu.Items.Add(_line);
+                    _menu.Items.Add(new ToolStripSeparator());
+
+                    var open = new ToolStripMenuItem("Open log");
+                    open.Click += (s, e) =>
+                    {
+                        try { if (Log.FilePath != null) Process.Start(Log.FilePath); }
+                        catch (Exception ex) { Log.Warn("open log: " + ex.Message); }
+                    };
+                    _menu.Items.Add(open);
+
+                    var exit = new ToolStripMenuItem("Exit launcher");
+                    exit.Click += (s, e) =>
+                    {
+                        Log.Warn("Exit chosen in the tray");
+                        var h = OnExit; if (h != null) h();     // Program cancels the run
+                        Notice.Close();
+                        try { Application.Exit(); } catch { }
+                    };
+                    _menu.Items.Add(exit);
+
+                    _menu.Opening += (s, e) => { _line.Text = _status; };
+
+                    System.Drawing.Icon ico = null;
+                    try { ico = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+                    catch { }
+                    _icon = new NotifyIcon { Icon = ico, ContextMenuStrip = _menu, Visible = true };
+                    _icoPath = Path.Combine(Cfg.AppDir ?? "", "goodpizza.ico");
+                    SetText("Good Pizza, Great Pizza");
+
+                    // The tooltip follows the current step without every log line
+                    // having to marshal onto this thread.
+                    var timer = new System.Windows.Forms.Timer { Interval = 1000 };
+                    timer.Tick += (s, e) =>
+                    {
+                        try
+                        {
+                            SetText(_status);
+                            // the .ico can be dropped in beside the exe to re-skin
+                            // the icon live; if it vanishes, fall back to the exe's
+                            if (_icoPath != null && File.Exists(_icoPath))
+                            {
+                                var mt = File.GetLastWriteTimeUtc(_icoPath);
+                                if (mt != _lastIcoUtc)
+                                {
+                                    _lastIcoUtc = mt;
+                                    _icon.Icon = new System.Drawing.Icon(_icoPath);   // replaces; Dispose is by NotifyIcon
+                                }
+                            }
+                        }
+                        catch { }
+                    };
+                    timer.Start();
+
+                    ready.Set();
+                    Application.Run();
+                }
+                catch (Exception ex) { Log.Warn("tray icon: " + ex.Message); }
+                finally { ready.Set(); }
+            });
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;          // never keeps the process alive on its own
+            t.Start();
+            ready.WaitOne(3000);
+        }
+
+        static DateTime _lastIcoUtc;
+
+        // NotifyIcon.Text throws past 63 characters on the .NET Framework, so
+        // the status is truncated here rather than taking the tray down.
+        static void SetText(string s)
+        {
+            var full = "Good Pizza, Great Pizza - " + (s ?? "");
+            _icon.Text = full.Length <= 63 ? full : full.Substring(0, 60) + "...";
+        }
+
+        public static void SetStatus(string s) { _status = s; }
+
+        public static void Stop()
+        {
+            ContextMenuStrip m;
+            NotifyIcon ic;
+            lock (L) { ic = _icon; m = _menu; _icon = null; _menu = null; }
+            if (ic == null) return;
+            // Application.ExitThread() must run on the tray's own thread - calling
+            // it here would target the main thread's (nonexistent) message loop.
+            try
+            {
+                if (m != null && m.IsHandleCreated)
+                    m.BeginInvoke(new Action(() => { ic.Visible = false; ic.Dispose(); Application.ExitThread(); }));
+                else { ic.Visible = false; ic.Dispose(); }
+            }
+            catch { try { ic.Visible = false; ic.Dispose(); } catch { } }
+        }
+    }
+
+    // ------------------------------------------------------ progress window
+    // A ~700 MB download must not be buried in a log file nobody opens. This is
+    // a small always-on-top window with a bar, the exact MB counts and the
+    // measured transfer rate, updated from the download thread. It is only used
+    // for the WSA archive: a 600 KB tool download does not deserve a window.
+    internal static class ProgressWin
+    {
+        static readonly object L = new object();
+        static Form _form;
+        static Label _detail, _rate;
+        static ProgressBar _bar;
+
+        public static void Show(string title)
+        {
+            var ready = new ManualResetEvent(false);
+            var t = new Thread(() =>
+            {
+                try
+                {
+                    var f = new Form
+                    {
+                        Text = title,
+                        FormBorderStyle = FormBorderStyle.FixedDialog,
+                        MaximizeBox = false,
+                        MinimizeBox = false,
+                        ShowInTaskbar = false,
+                        TopMost = true,
+                        StartPosition = FormStartPosition.CenterScreen,
+                        Size = new System.Drawing.Size(430, 128)
+                    };
+                    _detail = new Label { Left = 14, Top = 12, Width = 400, Height = 20, Text = "starting..." };
+                    _bar = new ProgressBar
+                    {
+                        Left = 14, Top = 36, Width = 400, Height = 24,
+                        Style = ProgressBarStyle.Marquee, MarqueeAnimationSpeed = 30
+                    };
+                    _rate = new Label { Left = 14, Top = 68, Width = 400, Height = 20, Text = "" };
+                    f.Controls.Add(_detail); f.Controls.Add(_bar); f.Controls.Add(_rate);
+                    lock (L) { _form = f; }
+                    f.Shown += (s, e) => ready.Set();
+                    Application.Run(f);
+                }
+                catch (Exception ex) { Log.Warn("progress window: " + ex.Message); }
+                finally { ready.Set(); }
+            });
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
+            ready.WaitOne(3000);
+        }
+
+        // called from the download thread at the throttled progress ticks
+        public static void Set(long done, long total, double mbPerSec)
+        {
+            Form f; lock (L) { f = _form; }
+            if (f == null || !f.IsHandleCreated) return;
+            try
+            {
+                f.BeginInvoke(new Action(() =>
+                {
+                    if (_bar.Style != ProgressBarStyle.Blocks)
+                    {
+                        _bar.Style = ProgressBarStyle.Blocks;
+                        _bar.Maximum = 100;
+                    }
+                    var pct = total > 0 ? (int)Math.Min(100L, done * 100L / total) : 0;
+                    _bar.Value = Math.Max(0, Math.Min(100, pct));
+                    _detail.Text = total > 0
+                        ? (done / 1048576.0).ToString("0", CultureInfo.InvariantCulture) + " of " +
+                          (total / 1048576.0).ToString("0", CultureInfo.InvariantCulture) + " MB   (" + pct + "%)"
+                        : (done / 1048576.0).ToString("0", CultureInfo.InvariantCulture) + " MB downloaded";
+
+                    var left = -1.0;
+                    if (mbPerSec > 0.05 && total > done) left = (total - done) / (mbPerSec * 1048576.0);
+                    _rate.Text = mbPerSec.ToString("0.0", CultureInfo.InvariantCulture) + " MB/s" +
+                        (left > 0
+                            ? "   -   about " + left.ToString("0", CultureInfo.InvariantCulture) + " s left"
+                            : "");
+                }));
+            }
+            catch { }
+        }
+
+        // called while the file is hashing / installing: same window, new text
+        public static void Status(string s)
+        {
+            Form f; lock (L) { f = _form; }
+            if (f == null || !f.IsHandleCreated) return;
+            try { f.BeginInvoke(new Action(() => { _detail.Text = s; _rate.Text = ""; })); }
+            catch { }
+        }
+
+        public static void Finish()
+        {
+            Form f; lock (L) { f = _form; _form = null; }
+            if (f == null) return;
+            try { f.BeginInvoke(new Action(() => { try { f.Close(); } catch { } })); }
+            catch { }
+        }
+    }
+
     // ------------------------------------------------------- logcat watcher
     // Reads WSA's own logcat straight off LocalState - no adb, no developer mode.
     // Incremental and line-based: it remembers a byte offset per file, so a 14 MB
@@ -426,13 +654,17 @@ namespace GoodPizza
             }
 
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; Cancelled = true; };
-            AppDomain.CurrentDomain.ProcessExit += (s, e) => { Cancelled = true; Notice.Close(); CleanupTemp(); Log.Close(); };
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => { Cancelled = true; Notice.Close(); Tray.Stop(); CleanupTemp(); Log.Close(); };
+
+            Tray.OnExit = () => { Cancelled = true; };   // menu "Exit launcher" == Ctrl+C
+            Tray.Start();
 
             int exit;
             try { exit = Run(); }
             catch (OperationCanceledException) { Log.Warn("cancelled"); exit = 130; }
             catch (Exception ex) { Log.Err("unhandled exception: " + ex); exit = 1; ShowFailureWindow("unexpected error", ex.Message, ""); }
 
+            Tray.Stop();
             try { mtx.ReleaseMutex(); } catch { }
             Log.Close();
             return exit;
@@ -463,6 +695,7 @@ namespace GoodPizza
                 var label = "check " + (i + 1) + "/" + steps.Length + " - " + s.Name;
                 _cause = null;
                 Log.Step(label + " ...");
+                Tray.SetStatus(s.Name + "  (" + (i + 1) + "/" + steps.Length + ")");
                 var sw = Stopwatch.StartNew();
                 bool ok;
                 try { ok = s.Body(); }
@@ -479,7 +712,10 @@ namespace GoodPizza
                 }
                 Log.Ok(label + " passed (" + secs + "s)");
             }
-            Log.Ok("all checks passed; game launched");
+            // LaunchGame only returns once the game window is gone, so by here
+            // the run is genuinely over rather than merely submitted.
+            Log.Ok("all checks passed; game closed - exiting");
+            Tray.SetStatus("done");
             return 0;
         }
 
@@ -774,7 +1010,9 @@ namespace GoodPizza
 
             if (!Confirm(a)) return Fail("WSA download declined by the user");
             if (!NeedSpace(a.Size > 0 ? a.Size : 3L * 1073741824)) return false;
-            if (!DownloadFile(a.Url, target, a.Size, a.Sha256, a.Name)) return false;
+            // The archive is by far the largest transfer in the whole run, so it
+            // gets the progress window; the small tool downloads stay log-only.
+            if (!DownloadFile(a.Url, target, a.Size, a.Sha256, a.Name, true)) return false;
             archive = target;
             return true;
         }
@@ -811,23 +1049,25 @@ namespace GoodPizza
         static bool Confirm(Asset a)
         {
             if (Cfg.Yes) { Log.Info("download pre-approved (--yes)"); return true; }
-            var sb = new StringBuilder();
-            sb.AppendLine("Windows Subsystem for Android (WSA) was not found on this PC.");
-            sb.AppendLine("Microsoft no longer distributes it, so the launcher can download a community build:");
-            sb.AppendLine();
-            sb.AppendLine("  File:    " + a.Name);
-            // GB first, MB in brackets: he wants to know how many GB this is
-            // before committing to it; the MB figure stays for reference.
-            sb.AppendLine("  Size:    " + (a.Size > 0 ? Gb(a.Size) + " (" + Size(a.Size) + ")" : "unknown (several GB)"));
-            sb.AppendLine("  Source:  " + a.Source);
-            sb.AppendLine("  Install: " + Cfg.WsaRoot);
-            if (a.Name.EndsWith(".7z", StringComparison.OrdinalIgnoreCase) && Find7z() == null)
-                sb.AppendLine("  Also:    7-Zip's small extractor (7zr.exe) from 7-zip.org");
+
+            // Everything that is useful but not decision-critical goes to the log
+            // instead of the question, which stays short on purpose: the user is
+            // being asked one thing - spend the bandwidth or not.
+            Log.Info("asset: " + a.Name + "  from " + a.Source);
             if (string.IsNullOrEmpty(a.Sha256))
-                sb.AppendLine("  Note:    no checksum is published for this file, so integrity is checked by size only.");
+                Log.Warn("no checksum is published for this asset; integrity will be checked by size only");
+
+            var sb = new StringBuilder();
+            sb.AppendLine("WSA is not installed on this PC.");
+            sb.AppendLine("Download it now?");
             sb.AppendLine();
-            sb.Append("Download and install it now?");
+            sb.AppendLine("   " + (a.Size > 0 ? Gb(a.Size) + "  (" + Size(a.Size) + ")" : "several GB"));
+            sb.AppendLine("   from " + a.Source);
+            sb.AppendLine();
+            sb.Append("Installs to " + Cfg.WsaRoot);
+
             Log.Info("asking user to approve download of " + a.Name);
+            Tray.SetStatus("waiting for your answer: download WSA?");
             var r = MessageBox.Show(sb.ToString(), "Good Pizza, Great Pizza - download WSA?",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1);
             Log.Info("user answered: " + r);
@@ -980,7 +1220,20 @@ namespace GoodPizza
         }
 
         // ---- download with resume, retries, progress, hash --------------------------
-        static bool DownloadFile(string url, string dest, long expectedSize, string expectedSha, string label)
+        // `ui` wraps the transfer in the progress window (used for the WSA
+        // archive only); the core loop itself is unchanged and shared.
+        static bool DownloadFile(string url, string dest, long expectedSize, string expectedSha, string label, bool ui = false)
+        {
+            if (ui)
+            {
+                ProgressWin.Show("Downloading WSA - " + label);
+                try { return DownloadFileCore(url, dest, expectedSize, expectedSha, label); }
+                finally { ProgressWin.Finish(); }
+            }
+            return DownloadFileCore(url, dest, expectedSize, expectedSha, label);
+        }
+
+        static bool DownloadFileCore(string url, string dest, long expectedSize, string expectedSha, string label)
         {
             var part = dest + ".part";
             const int maxAttempts = 5;
@@ -1001,6 +1254,7 @@ namespace GoodPizza
                     if (!string.IsNullOrEmpty(expectedSha))
                     {
                         Log.Info("verifying SHA-256 ...");
+                        ProgressWin.Status("verifying SHA-256 ...");
                         var got = Sha256Of(part);
                         if (!got.Equals(expectedSha, StringComparison.OrdinalIgnoreCase))
                         {
@@ -1073,7 +1327,7 @@ namespace GoodPizza
                                                 FileAccess.Write, FileShare.Read))
                 {
                     var buf = new byte[81920];
-                    long done = have, startBytes = have, lastLog = 0;
+                    long done = have, startBytes = have, lastLog = 0, lastUi = 0;
                     var sw = Stopwatch.StartNew();
                     int n;
                     while ((n = src.Read(buf, 0, buf.Length)) > 0)
@@ -1081,10 +1335,17 @@ namespace GoodPizza
                         if (Cancelled) throw new OperationCanceledException();
                         dst.Write(buf, 0, n);
                         done += n;
-                        if (sw.ElapsedMilliseconds - lastLog >= 5000)      // throttled progress
+                        var rate = (done - startBytes) / 1048576.0 / Math.Max(0.001, sw.Elapsed.TotalSeconds);
+                        if (sw.ElapsedMilliseconds - lastUi >= 250)           // window + tray: keep it alive
+                        {
+                            lastUi = sw.ElapsedMilliseconds;
+                            ProgressWin.Set(done, total, rate);
+                            Tray.SetStatus("downloading WSA - " + MB(done) + " of " +
+                                           (total > 0 ? MB(total) : "?") + " MB - " + N(rate) + " MB/s");
+                        }
+                        if (sw.ElapsedMilliseconds - lastLog >= 5000)         // log: readable, every 5s
                         {
                             lastLog = sw.ElapsedMilliseconds;
-                            var rate = (done - startBytes) / 1048576.0 / Math.Max(0.001, sw.Elapsed.TotalSeconds);
                             Log.Info("  " + (total > 0 ? N(done * 100.0 / total) + "%  " : "") +
                                      MB(done) + " MB  " + N(rate) + " MB/s");
                         }
@@ -1657,6 +1918,7 @@ namespace GoodPizza
             Notice.Show("Good Pizza launcher - action needed",
                 "Sign in to Google in the Play Store window, then tap Install.\r\n" +
                 "The launcher is waiting and will start the game when it is installed.");
+            Tray.SetStatus("waiting for Google sign-in + install");
             try
             {
                 var sw = Stopwatch.StartNew();
@@ -1690,6 +1952,7 @@ namespace GoodPizza
                     {
                         lastLog = sw.ElapsedMilliseconds;
                         Log.Info("  still waiting for sign-in / install (" + (sw.ElapsedMilliseconds / 60000) + " min)");
+                        Tray.SetStatus("waiting for sign-in - " + (sw.ElapsedMilliseconds / 60000) + " min");
                     }
                 }
                 return Fail("the game was not installed within " + Cfg.InstallTimeoutMin +
@@ -1716,14 +1979,31 @@ namespace GoodPizza
             Log.Info("launch submitted; waiting for the game window");
 
             var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < LaunchConfirmMs)
+            var seen = false;
+            while (sw.ElapsedMilliseconds < LaunchConfirmMs && !Cancelled)
             {
                 Wait(2000);
-                if (GameWindowPresent()) { Log.Ok("game window visible after " + (sw.ElapsedMilliseconds / 1000) + "s"); return true; }
+                if (GameWindowPresent()) { seen = true; break; }
             }
+            if (seen) Log.Ok("game window visible after " + (sw.ElapsedMilliseconds / 1000) + "s");
             // The launch was submitted; a title mismatch must not strand a working install.
-            Log.Warn("could not confirm a window titled '*" + Cfg.GameWindowTitle + "*' within " +
-                     (LaunchConfirmMs / 1000) + "s (set GameWindowTitle if the title differs)");
+            else Log.Warn("could not confirm a window titled '*" + Cfg.GameWindowTitle + "*' within " +
+                          (LaunchConfirmMs / 1000) + "s (set GameWindowTitle if the title differs)");
+            if (!seen) return true;     // nothing to follow
+
+            // This launcher is a wrapper, not a resident program: it stays around
+            // only while the game runs and leaves with it. Three consecutive
+            // misses (~12s) rather than one, because a single UIA scan can miss
+            // a window that is really there (a resize, a fullscreen toggle, a
+            // momentary animation).
+            Tray.SetStatus("playing - the launcher exits with the game");
+            var miss = 0;
+            while (true)                            // Wait() throws if the user picks Exit
+            {
+                Wait(3000);
+                if (GameWindowPresent()) { miss = 0; continue; }
+                if (++miss >= 3) { Log.Ok("game closed - exiting with the game"); break; }
+            }
             return true;
         }
 

@@ -1009,8 +1009,17 @@ namespace GoodPizza
 
             HttpWebResponse resp;
             try { resp = (HttpWebResponse)req.GetResponse(); }
-            catch (WebException wex) when (wex.Response is HttpWebResponse && (int)((HttpWebResponse)wex.Response).StatusCode == 416)
+            catch (WebException wex)
             {
+                // 416 = "range not satisfiable": the .part file no longer
+                // matches what the server has (re-uploaded or truncated
+                // remotely), so resume is impossible and we restart cleanly.
+                // Written as a runtime branch rather than `catch ... when`
+                // because that is a C# 6 exception filter and this file
+                // compiles with the .NET Framework csc (C# 5).
+                var bad = wex.Response as HttpWebResponse;
+                if (bad == null || (int)bad.StatusCode != 416) throw;
+                try { bad.Close(); } catch { }
                 File.Delete(part);
                 throw new IOException("server rejected the resume range; restarting from zero");
             }
@@ -1100,11 +1109,17 @@ namespace GoodPizza
                 Log.Ok("WSA installed to " + root);
                 return true;
             }
-            catch (IOException ex) when (!IsDiskFull(ex))
+            catch (IOException ex)
             {
-                return Fail("could not place WSA files in " + root + ": " + ex.Message + " (is WSA running or a file locked?)");
+                // One catch with a branch, not two catch clauses: without C# 6
+                // exception filters two `catch (IOException ...)` handlers would
+                // be an unreachable-block error. IsDiskFull decides which of
+                // the two distinct causes we report.
+                if (!IsDiskFull(ex))
+                    return Fail("could not place WSA files in " + root + ": " + ex.Message +
+                                " (is WSA running or a file locked?)");
+                return Fail("disk full while extracting: " + ex.Message);
             }
-            catch (IOException ex) { return Fail("disk full while extracting: " + ex.Message); }
             finally { CleanupTemp(); _tmpDir = null; }
         }
 

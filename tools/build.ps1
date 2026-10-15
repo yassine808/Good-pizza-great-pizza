@@ -69,7 +69,14 @@ $argList = @(
     '/r:System.Core.dll'
     '/r:System.Drawing.dll'
     '/r:System.Windows.Forms.dll'
-    '/r:System.IO.Compression.FileSystem.dll'   # payload\wsa.zip extraction
+    # ZipFile lives in the .FileSystem assembly; ZipArchive - the type
+    # ZipFile.OpenRead returns - lives in System.IO.Compression itself.
+    # Referencing only the first gives "'ZipArchive' is defined in an
+    # assembly that is not referenced".
+    '/r:System.IO.Compression.FileSystem.dll'   # ZipFile.OpenRead
+    '/r:System.IO.Compression.dll'              # ZipArchive / entries
+    # JavaScriptSerializer (used to read the GitHub Releases API response)
+    '/r:System.Web.Extensions.dll'
 
     # UI Automation - the first-run consent dialog is driven through this
     '/r:UIAutomationClient.dll'

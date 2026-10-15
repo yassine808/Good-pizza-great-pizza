@@ -1,0 +1,14 @@
+# Build output - rebuild with tools\build.ps1, never committed.
+dist/
+
+# Third-party content. The WSA payload is >100 MB of someone else's build
+# (MagiskOnWSA, AGPL) and the three dependency .appx files. Git history is
+# permanent, so keeping it out here is what stops the repo bloating forever.
+# The launcher downloads/extracts what it needs at runtime instead.
+payload/
+
+# Runtime logs written next to the exe.
+*.log
+
+# Scratch dirs used by the lab scripts.
+_build/

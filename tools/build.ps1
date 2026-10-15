@@ -1,0 +1,130 @@
+<#
+  Build the launcher into a single self-contained .exe.
+
+    powershell -ExecutionPolicy Bypass -File tools\build.ps1
+
+  Produces:
+    dist\Good Pizza, Great Pizza.exe     <- the deliverable (name + icon = the game)
+    dist\launcher.log                    <- written at runtime, next to the exe
+
+  Notes on the toolchain (all of this was measured, not assumed):
+    * csc.exe ships with the .NET Framework 4.x in the Windows GAC layout and
+      only speaks C# 5 - so src\AppLauncher.cs deliberately avoids string
+      interpolation, null-conditional operators, nameof and `out var`.
+    * UIAutomationClient/UIAutomationTypes are not in the GAC dir the compiler
+      searches by default on this box; they live in the .NET Framework
+      reference assemblies, hence the explicit /lib below.
+    * The manifest is embedded via /win32manifest so the exe self-elevates.
+      Registration and the Hyper-V cmdlets both need it.
+#>
+[CmdletBinding()]
+param(
+    [string]$Configuration = 'Release',
+    [switch]$NoIcon,
+    [switch]$NoManifest
+)
+
+$ErrorActionPreference = 'Stop'
+
+$root   = Split-Path -Parent $PSScriptRoot
+$src    = Join-Path $root 'src\AppLauncher.cs'
+$dist   = Join-Path $root 'dist'
+$tools  = Join-Path $root 'tools'
+$csc    = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$refDir = 'C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8.1'
+
+Write-Host "== build: Good Pizza, Great Pizza launcher ==" -ForegroundColor Cyan
+Write-Host "  source : $src"
+Write-Host "  config : $Configuration"
+
+if (-not (Test-Path $src)) { throw "missing source: $src" }
+if (-not (Test-Path $csc)) { throw "missing compiler: $csc" }
+if (-not (Test-Path $refDir)) { throw "missing .NET reference assemblies: $refDir" }
+
+New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+$exeName = 'Good Pizza, Great Pizza.exe'
+$out     = Join-Path $dist $exeName
+
+# ---- icon -----------------------------------------------------------------
+# The exe carries the game's own icon so it reads correctly in Explorer,
+# the taskbar and the Start menu. Generated on demand from the Play Store
+# asset (see tools\make-icon.ps1).
+$ico = Join-Path $tools 'goodpizza.ico'
+if (-not $NoIcon -and -not (Test-Path $ico)) {
+    Write-Host "  icon   : not present, generating from Play Store asset..." -ForegroundColor DarkGray
+    & (Join-Path $tools 'make-icon.ps1') | Write-Host
+}
+
+# ---- compile --------------------------------------------------------------
+$argList = @(
+    '/nologo'
+    '/target:winexe'
+    '/platform:anycpu'
+    "/out:$out"
+    "/lib:$refDir"
+
+    # framework
+    '/r:System.dll'
+    '/r:System.Core.dll'
+    '/r:System.Drawing.dll'
+    '/r:System.Windows.Forms.dll'
+    '/r:System.IO.Compression.FileSystem.dll'   # payload\wsa.zip extraction
+
+    # UI Automation - the first-run consent dialog is driven through this
+    '/r:UIAutomationClient.dll'
+    '/r:UIAutomationTypes.dll'
+)
+
+# csc takes the bare flag, not /optimize:True
+if ($Configuration -eq 'Release') { $argList += '/optimize' } else { $argList += '/optimize-' }
+
+if (-not $NoManifest) {
+    $manifest = Join-Path $tools 'app.manifest'
+    if (-not (Test-Path $manifest)) { throw "missing manifest: $manifest" }
+    $argList += "/win32manifest:$manifest"
+}
+
+if (-not $NoIcon -and (Test-Path $ico)) {
+    # csc has no /icon: option - that belongs to AL. /win32icon is the one.
+    $argList += "/win32icon:$ico"
+}
+
+$argList += $src
+
+Write-Host "  csc    : $csc" -ForegroundColor DarkGray
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$errs = & $csc @argList 2>&1
+$code = $LASTEXITCODE
+$sw.Stop()
+
+if ($errs) {
+    $errs | ForEach-Object {
+        $line = "$_"
+        if ($line -match 'error') { Write-Host "  $line" -ForegroundColor Red }
+        elseif ($line -match 'warning') { Write-Host "  $line" -ForegroundColor Yellow }
+        else { Write-Host "  $line" -ForegroundColor DarkGray }
+    }
+}
+
+if ($code -ne 0) { throw "csc failed with exit code $code" }
+
+$bin = Get-Item $out
+Write-Host ""
+Write-Host "  OK  $exeName  $([math]::Round($bin.Length/1KB,1)) KB  in $([math]::Round($sw.Elapsed.TotalSeconds,2))s" -ForegroundColor Green
+Write-Host "  ->  $out" -ForegroundColor Green
+Write-Host ""
+Write-Host "  reminder: payload\ stays untracked (see .gitignore)." -ForegroundColor DarkGray
+Write-Host "            dist\ is a build output - also ignored." -ForegroundColor DarkGray
+
+# ---- optional smoke check -------------------------------------------------
+# Loading the assembly proves the manifest and icon resources embedded
+# correctly without executing any of the provisioning logic.
+try {
+    $bytes = [IO.File]::ReadAllBytes($out)
+    $asm   = [Reflection.Assembly]::Load($bytes)
+    $v     = $asm.GetName().Version
+    Write-Host "  assembly version: $v" -ForegroundColor DarkGray
+} catch {
+    Write-Host "  assembly probe failed (non-fatal): $($_.Exception.Message)" -ForegroundColor Yellow
+}

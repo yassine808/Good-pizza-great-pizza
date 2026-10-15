@@ -323,23 +323,43 @@ order:
 
 ## The Play Store half
 
+A virgin image ships with **developer mode OFF**, so port `58526` never opens and adb
+cannot be used to observe or poke anything. Every signal below was chosen because it
+works without adb.
+
 Once the VM is up, the launcher:
 
-1. waits for the **adb bridge** on `127.0.0.1:58526`
-2. waits for Android framework readiness (`sys.boot_completed`)
-3. verifies Play Store (`com.android.vending`) is present
-4. verifies the Google account is signed in — **polling every 30 s, up to 10 minutes**,
-   because sign-in is your step
-5. opens `market://details?id=com.tapblaze.pizzabusiness`, so Play records
-   `installerPackageName=com.android.vending`
-6. installs the **split** APK release, which carries
-   `require_split=split_config.etc1_rgb8_group_hd.apk` — the ASTC texture fix, without
-   which in-game textures render black
-7. launches the game and exits
+1. confirms boot by reading WSA's own logcat under
+   `LocalState\diagnostics\logcat\` for `"Boot is finished"` — and/or an Android window
+   enumerating through UI Automation. It does **not** gate on adb.
+2. opens `market://details?id=com.tapblaze.pizzabusiness`, so Play records
+   `installerPackageName=com.android.vending`. PairIP kills any install that did not
+   come from Play, so the APK is **never** pushed.
+3. **re-fires** that `market://` every 45 s, for up to 20 minutes. This is not
+   belt-and-braces: on an image that has never signed into Google the store process
+   starts and then dies outright —
+   `ActivityManager: Process com.android.vending (pid N) has died` — so no window ever
+   enumerates until you complete sign-in. The launcher waits; it never enters credentials.
+4. detects the install from logcat evidence that the apk is resident on
+   `/data/app/...` (`/data/app/`, `Start proc`, `dexopt`, `Package [pkg]`). A bare
+   mention of the package name is *not* accepted — opening the store listing logs
+   `market://details?id=...` which contains it.
+5. sets the ASTC texture split best-effort via adb if the bridge happens to be up —
+   `debug.require_split=split_config.etc1_rgb8_group_hd.apk`, without which in-game
+   textures render black. Developer mode being off means this usually cannot run, so it
+   never blocks launch.
+6. launches the game and exits.
 
-If you have not signed in yet, the Play Store simply opens and waits. The launcher polls;
-the moment the account appears it continues on its own, all the way to launching the
-game. You never have to come back to it.
+> **Why not detect the install from `LocalState`?** Because that cache lies. The
+> `.ico`/`.png` and even package directories are written Windows-side and survive a
+> userdata wipe. Measured on a freshly reimaged image containing **no apps at all**:
+> `com.tapblaze.pizzabusiness.ico/.png` were still present, `org.mozilla.firefox/` still
+> had its directory, and `com.google.android.gms` produced **14 755** logcat hits while
+> having **no** directory. Logcat tracks reality; `LocalState` does not.
+
+If you have not signed in yet, the Play Store cannot come up. The launcher keeps
+re-submitting the listing and waiting; the moment the account appears it continues on its
+own, all the way to launching the game. You never have to come back to it.
 
 ---
 
@@ -348,16 +368,31 @@ game. You never have to come back to it.
 ```
 Good-pizza-great-pizza/
 ├── README.md
+├── .gitignore                         dist/, payload/, *.log
 ├── docs/
 │   └── screenshots/
 │       └── first-run-consent.png    first-run gate, captured from the real dialog
-├── app.txt                          package=com.tapblaze.pizzabusiness
-├── AppLauncher.cs                   the launcher (in progress)
-├── payload/                         wsa.zip, split APKs  (gitignored — too big)
+├── src/
+│   └── AppLauncher.cs                 the launcher (single file, C# 5, ~900 lines)
+├── payload/                           wsa.zip, split APKs  (gitignored — too big)
 └── tools/
-    ├── build.ps1                    builds to %TEMP%, copies into the project folder
-    ├── app.manifest                 requireAdministrator
-    └── make-icon.ps1                7-size .ico from the Play Store asset
+    ├── build.ps1                      compiles src/ -> dist/Good Pizza, Great Pizza.exe
+    ├── app.manifest                   requireAdministrator + PerMonitorV2 DPI
+    ├── make-icon.ps1                  7-size .ico from the Play Store asset
+    ├── goodpizza.ico                  generated icon (build input, committed)
+    ├── screenshot-dpi.ps1             DPI-aware capture used for docs/
+    ├── uia-click-continue.ps1         drives the first-run consent dialog
+    └── lab/                           the experiments behind every claim in this README
+        ├── repro-boot-crash.ps1       the 0xc0000409 signature
+        ├── test-userdata-template.ps1 real image vs template seeding
+        ├── test-blank-vhdx.ps1        blank 8 GB VHDX as the template
+        ├── boot-observation2.ps1      full boot timeline
+        ├── observe-boot.ps1           boot signal survey
+        ├── elevated-register.ps1      -Register with/without elevation
+        ├── dep-install.ps1            dependency floor checks
+        ├── setup-dump.ps1             WSA settings dump
+        ├── uia-tree-dump.ps1          UIA tree of Android windows
+        └── dump-strings.ps1           WsaClient string sweep
 ```
 
 `payload/` is gitignored on purpose: `wsa.zip` is ~1 GB and the split APKs are ~320 MB.

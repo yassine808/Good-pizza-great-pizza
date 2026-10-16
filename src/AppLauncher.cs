@@ -1058,8 +1058,10 @@ namespace GoodPizza
                 Log.Warn("no checksum is published for this asset; integrity will be checked by size only");
 
             var sb = new StringBuilder();
-            sb.AppendLine("WSA is not installed on this PC.");
-            sb.AppendLine("Download it now?");
+            // "WSA" means nothing to someone who double-clicked a game exe, so the
+            // first line spells it out and the second says why it is being asked for.
+            sb.AppendLine("Windows Subsystem for Android is not installed on this PC.");
+            sb.AppendLine("The game runs inside it. Download it now?");
             sb.AppendLine();
             sb.AppendLine("   " + (a.Size > 0 ? Gb(a.Size) + "  (" + Size(a.Size) + ")" : "several GB"));
             sb.AppendLine("   from " + a.Source);

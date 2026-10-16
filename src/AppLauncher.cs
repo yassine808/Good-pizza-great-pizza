@@ -38,6 +38,9 @@ using System.Web.Script.Serialization;
 using System.Windows.Automation;
 using System.Windows.Forms;
 using Microsoft.Win32;
+// System.Drawing is spelled out in full elsewhere in this file; one alias keeps
+// the download dialog's drawing code readable without touching any of that.
+using SD = System.Drawing;
 
 namespace GoodPizza
 {
@@ -957,6 +960,10 @@ namespace GoodPizza
         sealed class Asset
         {
             public string Name, Url, Sha256, Source;
+            // Where the release came from, so the prompt can offer it as a link: the
+            // user is about to spend three quarters of a gigabyte on a third-party
+            // build, and should be able to look at it first.
+            public string ReleaseUrl, ReleaseTag;
             public long Size = -1;
         }
 
@@ -1056,24 +1063,210 @@ namespace GoodPizza
             Log.Info("asset: " + a.Name + "  from " + a.Source);
             if (string.IsNullOrEmpty(a.Sha256))
                 Log.Warn("no checksum is published for this asset; integrity will be checked by size only");
-
-            var sb = new StringBuilder();
-            // "WSA" means nothing to someone who double-clicked a game exe, so the
-            // first line spells it out and the second says why it is being asked for.
-            sb.AppendLine("Windows Subsystem for Android is not installed on this PC.");
-            sb.AppendLine("The game runs inside it. Download it now?");
-            sb.AppendLine();
-            sb.AppendLine("   " + (a.Size > 0 ? Gb(a.Size) + "  (" + Size(a.Size) + ")" : "several GB"));
-            sb.AppendLine("   from " + a.Source);
-            sb.AppendLine();
-            sb.Append("Installs to " + Cfg.WsaRoot);
+            if (a.Size > 0) Log.Info("download size: " + Gb(a.Size) + " (" + Size(a.Size) + ")");
+            Log.Info("destination: " + Cfg.CacheDir + Path.DirectorySeparatorChar + a.Name);
 
             Log.Info("asking user to approve download of " + a.Name);
             Tray.SetStatus("waiting for your answer: download WSA?");
-            var r = MessageBox.Show(sb.ToString(), "Good Pizza, Great Pizza - download WSA?",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1);
-            Log.Info("user answered: " + r);
-            return r == DialogResult.Yes;
+            using (var d = new DownloadPrompt(a))
+            {
+                var r = d.ShowDialog();
+                Log.Info("user answered: " + r);
+                return r == DialogResult.Yes;
+            }
+        }
+
+        // ---- the download prompt -------------------------------------------------
+        // This used to be a MessageBox, which had two problems. It could not show a
+        // clickable source, and - because the launcher runs elevated - it opened
+        // *behind* whatever the user already had open, so a run could look like it had
+        // done nothing at all (observed here: a prompt hidden behind a maximised
+        // browser). A real dialog gets the source link, an always-on-top window, and
+        // the room to say what WSA is before asking for three quarters of a gigabyte.
+        sealed class DownloadPrompt : Form
+        {
+            public DownloadPrompt(Asset a)
+            {
+                Text = "Good Pizza, Great Pizza";
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                MaximizeBox = false;
+                MinimizeBox = false;
+                // In the taskbar on purpose: if this ever lands on a screen the user
+                // is not looking at, there has to be a button to find it by.
+                ShowInTaskbar = true;
+                TopMost = true;
+                // Not CenterScreen: that centres on the primary display regardless of
+                // where the user is, and on a two-monitor PC the question can then
+                // appear on the other screen, where it reads as "nothing happened".
+                StartPosition = FormStartPosition.Manual;
+                Font = new SD.Font("Segoe UI", 9F);
+                ClientSize = new SD.Size(430, 256);
+
+                try
+                {
+                    // The game's own icon, so the prompt is recognisably part of the
+                    // thing the user double-clicked rather than a system box.
+                    var ico = SD.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                    if (ico != null)
+                    {
+                        Icon = ico;
+                        Controls.Add(new PictureBox
+                        {
+                            Left = 18, Top = 16, Size = new SD.Size(34, 34),
+                            SizeMode = PictureBoxSizeMode.Zoom, Image = ico.ToBitmap()
+                        });
+                    }
+                }
+                catch { /* an icon is decoration; never let it stop the question */ }
+
+                // "WSA" means nothing to someone who double-clicked a game exe, so the
+                // heading spells it out and the body says why it is being asked for.
+                var head = new Label
+                {
+                    Left = 62, Top = 16, Width = 352, AutoSize = true,
+                    Font = new SD.Font(Font, SD.FontStyle.Bold),
+                    ForeColor = SD.Color.FromArgb(32, 32, 32),
+                    Text = "Windows Subsystem for Android" + Environment.NewLine + "is not installed on this PC"
+                };
+                var body = new Label
+                {
+                    Left = 62, Top = 58, Width = 352, AutoSize = true,
+                    ForeColor = SD.Color.FromArgb(88, 88, 88),
+                    Text = "The game runs inside it. Download it now?"
+                };
+
+                Controls.Add(new Panel { Left = 18, Top = 94, Size = new SD.Size(394, 1), BackColor = SD.Color.FromArgb(228, 228, 228) });
+
+                Controls.Add(Caption("Download", 106));
+                Controls.Add(Value(a.Size > 0 ? Gb(a.Size) + "   (" + Size(a.Size) + ")" : "several GB", 106));
+                Controls.Add(Caption("Source", 130));
+                Controls.Add(SourceRow(a, 130));
+                if (!string.IsNullOrEmpty(a.ReleaseTag))
+                    Controls.Add(new Label
+                    {
+                        Left = 154, Top = 150, Width = 258, AutoSize = true,
+                        Font = new SD.Font(Font.FontFamily, 8F),
+                        ForeColor = SD.Color.FromArgb(146, 146, 146),
+                        Text = "release " + a.ReleaseTag
+                    });
+                Controls.Add(Caption("Installs to", 176));
+                Controls.Add(Value(Cfg.WsaRoot, 176));
+
+                Controls.Add(new Panel { Left = 18, Top = 202, Size = new SD.Size(394, 1), BackColor = SD.Color.FromArgb(228, 228, 228) });
+
+                var no = new Button { Text = "No", DialogResult = DialogResult.No, Size = new SD.Size(82, 28), Location = new SD.Point(330, 212) };
+                var yes = new Button
+                {
+                    Text = "Yes", DialogResult = DialogResult.Yes, Size = new SD.Size(82, 28),
+                    Location = new SD.Point(240, 212),
+                    Font = new SD.Font(Font, SD.FontStyle.Bold)
+                };
+                AcceptButton = yes;
+                CancelButton = no;
+
+                Controls.AddRange(new Control[] { head, body, no, yes });
+
+                // Centre on the screen the user is actually on - the one under the
+                // cursor - rather than on the primary display.
+                var wa = Screen.FromPoint(System.Windows.Forms.Cursor.Position).WorkingArea;
+                Location = new SD.Point(wa.Left + (wa.Width - Width) / 2, wa.Top + (wa.Height - Height) / 2);
+            }
+
+            // Measured, not assumed. TopMost = true was not enough: the WS_EX_TOPMOST
+            // bit stayed clear, and it stayed clear for a plain test form too - on this
+            // box, with NVIDIA Overlay / Broadcast and Discord's overlay running, an
+            // ordinary app simply cannot enter the topmost band (SetWindowPos returns
+            // True and the bit never lands; the taskbar still manages it, so the
+            // mechanism itself works). So the prompt asks for attention the way any
+            // background window is allowed to: it takes focus, and if something else
+            // holds focus it flashes its taskbar button instead of sitting there
+            // silently, which is how an unanswered prompt used to look like the
+            // launcher doing nothing.
+            protected override void OnShown(EventArgs e)
+            {
+                base.OnShown(e);
+                SetWindowPos(Handle, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+                Activate();
+                // Form.Activate() returns void, so "did we get focus?" is answered by
+                // asking the OS who the foreground window actually is.
+                var activated = GetForegroundWindow() == Handle;
+                if (!activated)
+                {
+                    var fi = new Flashwinfo();
+                    fi.cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(Flashwinfo));
+                    fi.hwnd = Handle;
+                    fi.dwFlags = FlashAll;
+                    fi.uCount = 6;
+                    fi.dwTimeout = 0;
+                    FlashWindowEx(ref fi);
+                }
+                Log.Info("prompt shown: hwnd=" + Handle + " activated=" + activated +
+                         " exstyle=0x" + GetWindowLong(Handle, GwlExstyle).ToString("x8"));
+            }
+
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            static extern int GetWindowLong(IntPtr hWnd, int index);
+
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            static extern bool FlashWindowEx(ref Flashwinfo pfwi);
+
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            static extern IntPtr GetForegroundWindow();
+
+            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+            struct Flashwinfo
+            {
+                public uint cbSize;
+                public IntPtr hwnd;
+                public uint dwFlags;
+                public uint uCount;
+                public uint dwTimeout;
+            }
+
+            const int GwlExstyle = -20;
+            const uint FlashAll = 3;
+            static readonly IntPtr HwndTopmost = new IntPtr(-1);
+            const uint SwpNoMove = 0x0002, SwpNoSize = 0x0001, SwpNoActivate = 0x0010;
+
+            static Label Caption(string text, int top)
+            {
+                return new Label { Left = 18, Top = top, Width = 130, AutoSize = true, ForeColor = SD.Color.FromArgb(128, 128, 128), Text = text };
+            }
+
+            static Label Value(string text, int top)
+            {
+                return new Label { Left = 154, Top = top, Width = 258, AutoSize = true, ForeColor = SD.Color.FromArgb(32, 32, 32), Text = text };
+            }
+
+            // The build comes from a third-party repository, so the user should be able
+            // to look at it before spending the bandwidth on it.
+            static Control SourceRow(Asset a, int top)
+            {
+                var url = a.ReleaseUrl;
+                if (string.IsNullOrEmpty(url))
+                    return Value(a.Source, top);
+
+                var text = url;
+                var cut = text.IndexOf("/releases", StringComparison.OrdinalIgnoreCase);
+                if (cut > 0) text = text.Substring(0, cut);
+                text = text.Replace("https://", "").Replace("http://", "").TrimEnd('/');
+
+                var link = new LinkLabel { Left = 154, Top = top, Width = 258, AutoSize = true, Text = text };
+                link.LinkColor = SD.Color.FromArgb(0, 102, 204);
+                link.ActiveLinkColor = SD.Color.FromArgb(0, 76, 153);
+                link.VisitedLinkColor = SD.Color.FromArgb(122, 48, 160);
+                link.Links.Add(0, text.Length, url);
+                link.LinkClicked += (s, e) =>
+                {
+                    var target = e.Link.LinkData as string;
+                    try { Process.Start(target); }
+                    catch (Exception ex) { Log.Warn("could not open " + target + ": " + ex.Message); }
+                };
+                return link;
+            }
         }
 
         // ---- release discovery (GitHub Releases API) ------------------------------
@@ -1184,7 +1377,8 @@ namespace GoodPizza
                     best = new Asset
                     {
                         Name = name, Url = Str(ad, "browser_download_url"), Sha256 = digest, Size = size,
-                        Source = "github.com/" + Cfg.Repo + " release " + Str(rd, "tag_name")
+                        Source = "github.com/" + Cfg.Repo + " release " + Str(rd, "tag_name"),
+                        ReleaseUrl = Str(rd, "html_url"), ReleaseTag = Str(rd, "tag_name")
                     };
                 }
                 if (best != null && best.Url.Length > 0)

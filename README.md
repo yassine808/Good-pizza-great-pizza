@@ -1,11 +1,15 @@
 # Good Pizza, Great Pizza — one-click Windows launcher
 
+[![Latest release](https://img.shields.io/github/v/release/yassine808/Good-pizza-great-pizza)](https://github.com/yassine808/Good-pizza-great-pizza/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/yassine808/Good-pizza-great-pizza)](LICENSE)
+[![Windows 11](https://img.shields.io/badge/platform-Windows%2011%20%7C%20WSA-blue)](https://github.com/yassine808/Good-pizza-great-pizza/releases/latest)
+
 Run the Android game **Good Pizza, Great Pizza** (`com.tapblaze.pizzabusiness`) on
 Windows 11 with a single double-click. The launcher owns the whole chain — Windows
 subsystem check → WSA install → WSA boot → Google Play install → game launch — and
 stays **completely silent** unless something goes wrong.
 
-> **Status:** released. [`v1.0.0`](https://github.com/yassine808/Good-pizza-great-pizza/releases/latest)
+> **Status:** released. The [latest release](https://github.com/yassine808/Good-pizza-great-pizza/releases/latest)
 > is a single ~300 KB exe that provisions a clean Windows 11 machine end to end. The WSA
 > behaviour documented below is *reverse-engineered and verified on a real machine*
 > (15 Oct 2026), including a clean-room run that started from an empty `C:\WSA`.

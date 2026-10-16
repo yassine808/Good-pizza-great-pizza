@@ -92,7 +92,8 @@ millisecond too early shows whatever window happened to be on top instead.
 | A Google account | Sign-in is **your** step — the launcher never touches credentials |
 
 The launcher checks every one of these before touching anything, and names the first
-one that fails.
+one that fails. The whole run is one fixed sequence — see
+[the 12 checks, in order](#the-checks-in-the-order).
 
 ---
 
@@ -101,10 +102,19 @@ one that fails.
 ```mermaid
 flowchart TD
     A[User double-clicks<br/>Good Pizza, Great Pizza.exe] --> B{Windows 11<br/>22000+?}
-    B -- no --> E[LOG WINDOW<br/>names the blocker]
+    B -- no --> E[FAILURE WINDOW<br/>which check failed + the fix]
     B -- yes --> C{Virtualisation on?<br/>Hyper-V present?}
     C -- no --> E
-    C -- yes --> D{WSA package<br/>registered?}
+    C -- yes --> DM{Developer Mode on?<br/>Question 1 comes first}
+    DM -- admin policy off --> E
+    DM -- off --> Q1{Question 1:<br/>turn it on now?}
+    Q1 -- no --> QUIT[quiet exit, code 130<br/>nothing changed]
+    Q1 -- yes --> PRE{WSA files<br/>already present?}
+    DM -- on --> PRE
+    PRE -- no --> Q2[Question 2: download<br/>0.70 GB? + progress window]
+    Q2 -- no --> QUIT
+    Q2 -- yes --> D{WSA package<br/>registered?}
+    PRE -- yes --> D
     D -- no --> P[PROVISION]
     D -- yes --> F{WSA running?<br/>port 58526 open?}
     F -- no --> G[Boot via<br/>wsa:// protocol]
@@ -121,8 +131,8 @@ flowchart TD
     N -- no --> E
     N -- yes --> O[Open Play page<br/>installerPackageName]
     O --> K{Game installed?}
-    K -- no --> W[Play Store opens<br/>USER INSTALLS]
-    W --> X{Signed in yet?<br/>poll 30 s / max 10 min}
+    K -- no --> W[Play Store opens<br/>USER signs in + installs]
+    W --> X{installed yet?<br/>poll 3 s / re-fire 45 s<br/>max 30 min}
     X -- no --> X
     X -- yes --> K
     K -- yes --> Y[Apply ASTC texture fix]
@@ -135,9 +145,9 @@ flowchart TD
     style AA fill:#14532d,stroke:#86efac,color:#fff
 ```
 
-**Silent by default.** The launcher opens no main window. It only opens a log window
-when a check fails — and that window names *which* check failed and what to do about
-it. On success you never see it at all.
+**Silent by default.** The launcher opens no main window. It only opens the failure
+window when a check fails — and that window names *which* check failed and what to do
+about it. On success you never see it at all.
 
 While it works, its only presence is a **tray icon** whose status line tracks the
 current step: `downloading - 334/713 MB - 11.1 MB/s`, `waiting for
@@ -159,6 +169,33 @@ launcher stays resident behind the game.
 to deserve a window: a progress dialog with the byte count, the percentage, the
 transfer rate and a rough ETA. Small tool downloads stay in the log.
 
+### The checks, in order
+
+The whole chain is one fixed sequence of 12 checks. Each is logged as
+`check N/12 - <name> ...` and mirrored in the tray as `<name>  (N/12)`: checks 1–3
+only verify, 4–10 provision what is missing, 11 waits for you, and 12 launches and
+leaves with the game.
+
+| # | Check | What it does |
+|---|---|---|
+| 1 | Administrator rights | The process really is elevated |
+| 2 | Windows 11 | Registry build number ≥ 22000 |
+| 3 | virtualization | `HypervisorPresent` — the hypervisor is actually running; when false, it reads Virtual Machine Platform state to explain why: off, pending reboot, or virtualisation disabled in BIOS |
+| 4 | Developer Mode | Not blocked by an admin policy; when it is off, **Question 1** is asked *before anything is downloaded*, then both registry values are written and re-read to confirm |
+| 5 | WSA payload | A complete install at `C:\WSA` passes instantly; otherwise: find the release, **Question 2** (size in GB + clickable source), download behind the progress window, verify it against the release's SHA-256 (or the fingerprint we recorded — logged, never fatal), extract to `C:\WSA` and verify the files |
+| 6 | WSA dependencies | XAML 2.8 and both VCLibs packages at the manifest minimums; a missing one is installed from the payload's own `.appx` files |
+| 7 | WSA registration | Registers the package from `C:\WSA` to status `Ok`; a sideload refusal (`0x80073CFF`) is translated into "turn on Developer Mode" |
+| 8 | userdata template | `userdata.vhdx` exists in the package folder (blank 8 GB dynamic disk — Hyper-V module, diskpart fallback); without it first boot dies with `0xc0000409` |
+| 9 | WsaService | The Android service exists and reaches `Running` (started when stopped, 90 s budget) |
+| 10 | WSA boot | `wsa://` activation; clicks the first-run **Continue** every 10 s (shows the one-click notice when UIA cannot) while watching `userdata.2.vhdx`, `vmmemWSA` and WsaClient crash records; passes on logcat boot-finished, port 58526 or a visible Android window — 10 min timeout |
+| 11 | Play Store + game install | Opens the listing (`market://`), shows the sign-in notice, and polls for the game every 3 s for up to 30 min (adb package list, logcat, install marker on disk) — re-firing the listing every 45 s while no Android window is on screen; afterwards confirms `installerPackageName` and warns when the copy did not come from Play |
+| 12 | launch | Best-effort ASTC texture fix, `wsa://` with the "Launching..." bubble, confirms the game window within 90 s (a miss is a warning, never a failure), then follows the window and exits when the game closes |
+
+The first check that fails stops the run and opens the failure window with its
+`check N/12` label, the cause and the fix; the exit code counts the step — 10 for
+the first check, 21 for the last, 0 when all 12 pass. Answering **No** to either
+question is not a failure: the launcher exits with code `130` and changes nothing.
+
 ---
 
 ## The provisioning cycle
@@ -170,9 +207,13 @@ launcher verifies before moving on:
 stateDiagram-v2
     [*] --> CheckOS: double-click
     CheckOS --> CheckVirt: Win 11 build 22000+
-    CheckVirt --> InstallDeps: Hyper-V + VMP enabled
+    CheckVirt --> DevMode: hypervisor running
+    DevMode --> Payload: Question 1 answered Yes
+    Payload --> InstallDeps: Question 2 + 0.70 GB download
     InstallDeps --> Register: XAML 2.8 + VCLibs
-    Register --> Boot: Add-AppxPackage -Register
+    Register --> Userdata: status Ok
+    Userdata --> Service: userdata.vhdx ready
+    Service --> Boot: WsaService running
     Boot --> Consent: wsa:// protocol
     Consent --> CreateDisk: click Continue
     CreateDisk --> WaitVM: userdata.2.vhdx

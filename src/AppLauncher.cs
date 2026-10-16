@@ -1015,7 +1015,15 @@ namespace GoodPizza
                 archive = target; return true;
             }
 
-            if (!Confirm(a)) return Fail("WSA download declined by the user");
+            // Saying "No" is a decision, not a fault. It takes the same quiet
+            // path as the tray's "Exit" during a download - exit 130, nothing
+            // changed - rather than the "setup problem" window, which is for
+            // things the user did not choose and cannot get past by re-running.
+            if (!Confirm(a))
+            {
+                Log.Warn("WSA download declined by the user; nothing was changed");
+                throw new OperationCanceledException();
+            }
             if (!NeedSpace(a.Size > 0 ? a.Size : 3L * 1073741824)) return false;
             // The archive is by far the largest transfer in the whole run, so it
             // gets the progress window; the small tool downloads stay log-only.

@@ -444,7 +444,7 @@ Good-pizza-great-pizza/
 ├── .gitignore                         dist/, payload/, _build/, *.log
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                     six checks: build, hygiene, manifest, readme, dialogs, icon
+│       └── ci.yml                     seven checks: build, hygiene, manifest, readme, dialogs, tray, icon
 ├── docs/
 │   └── screenshots/
 │       ├── first-run-consent.png      first-run gate, captured from the real dialog
@@ -464,7 +464,7 @@ Good-pizza-great-pizza/
     ├── make-icon.ps1                  7-size .ico from the Play Store asset
     ├── goodpizza.ico                  generated icon (build input, committed)
     ├── ci/
-    │   └── check.ps1                  the five text checks (the build check is job 1 in ci.yml)
+    │   └── check.ps1                  the six text checks (the build check is job 1 in ci.yml)
     ├── screenshot-dpi.ps1             DPI-aware capture used for docs/
     ├── uia-click-continue.ps1         drives the first-run consent dialog
     └── lab/                           the experiments behind every claim in this README
@@ -511,7 +511,7 @@ committed binary.
 
 ## Continuous integration
 
-Every push runs six checks on GitHub Actions
+Every push runs seven checks on GitHub Actions
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 | Check | Asserts |
@@ -521,9 +521,10 @@ Every push runs six checks on GitHub Actions
 | manifest | the exe still requests `requireAdministrator` (registration fails `0x80073D28` without it) and declares `PerMonitorV2` |
 | readme | every relative link and image in this file resolves to a file that exists, so screenshots cannot rot |
 | dialogs | user-facing questions and failures go through `AskPrompt`/`Attention`; `MessageBox` only for the single-instance notice |
+| tray | every literal tray status fits Windows' 63-character tray-text budget after the 25-character title prefix — two statuses shipped once cut off |
 | icon | `tools\goodpizza.ico` exists with a valid ICO header (the build needs no network to embed it) |
 
-All six run `tools\ci\check.ps1`, the same script you can run locally:
+All six text checks run `tools\ci\check.ps1`, the same script you can run locally:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\ci\check.ps1 -Check hygiene

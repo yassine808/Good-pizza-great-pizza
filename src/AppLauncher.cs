@@ -210,6 +210,7 @@ namespace GoodPizza
     {
         static readonly object L = new object();
         static Form _form;
+        static bool _closing;
 
         sealed class NoticeForm : Form
         {
@@ -219,6 +220,7 @@ namespace GoodPizza
         public static void Show(string title, string text)
         {
             Close();
+            lock (L) { _closing = false; }
             var ready = new ManualResetEvent(false);
             var t = new Thread(() =>
             {
@@ -242,8 +244,24 @@ namespace GoodPizza
                         Padding = new Padding(10),
                         Font = new System.Drawing.Font("Segoe UI", 10)
                     });
-                    f.Shown += (s, e) => ready.Set();
-                    lock (L) { _form = f; }
+                    f.FormClosed += delegate(object s, FormClosedEventArgs e)
+                    {
+                        lock (L) { if (ReferenceEquals(_form, f)) _form = null; }
+                    };
+                    f.Shown += (s, e) =>
+                    {
+                        // Close() can land before the handle exists - its BeginInvoke
+                        // then fails silently and the reference is already gone, which
+                        // used to leave an uncloseable TopMost window on screen.
+                        bool c; lock (L) { c = _closing; }
+                        if (c) { try { f.Close(); } catch { } }
+                        ready.Set();
+                    };
+                    lock (L)
+                    {
+                        if (_closing) { ready.Set(); return; }   // closed while starting
+                        _form = f;
+                    }
                     Application.Run(f);
                 }
                 catch (Exception ex) { Log.Warn("notice window: " + ex.Message); }
@@ -258,7 +276,7 @@ namespace GoodPizza
         public static void Close()
         {
             Form f;
-            lock (L) { f = _form; _form = null; }
+            lock (L) { _closing = true; f = _form; _form = null; }
             if (f == null) return;
             try { f.BeginInvoke(new Action(() => f.Close())); } catch { }
         }
@@ -276,6 +294,7 @@ namespace GoodPizza
         static readonly object L = new object();
         static Form _form;
         static string _text;
+        static bool _closing;
 
         sealed class BubbleForm : Form
         {
@@ -286,6 +305,7 @@ namespace GoodPizza
         {
             lock (L) { if (_form != null && _text == text) return; }   // already up: no flicker
             Close();
+            lock (L) { _closing = false; }
             var ready = new ManualResetEvent(false);
             var t = new Thread(() =>
             {
@@ -309,8 +329,27 @@ namespace GoodPizza
                         Padding = new Padding(10),
                         Font = new System.Drawing.Font("Segoe UI", 10)
                     });
-                    f.Shown += (s, e) => ready.Set();
-                    lock (L) { _form = f; _text = text; }
+                    // The user may close the bubble with its own X: forget it, or the
+                    // dedupe guard above would suppress every later Show of that text
+                    // and the launcher would look idle again for the rest of the run.
+                    f.FormClosed += delegate(object s, FormClosedEventArgs e)
+                    {
+                        lock (L)
+                        {
+                            if (ReferenceEquals(_form, f)) { _form = null; _text = null; }
+                        }
+                    };
+                    f.Shown += (s, e) =>
+                    {
+                        bool c; lock (L) { c = _closing; }
+                        if (c) { try { f.Close(); } catch { } }
+                        ready.Set();
+                    };
+                    lock (L)
+                    {
+                        if (_closing) { ready.Set(); return; }   // closed while starting
+                        _form = f; _text = text;
+                    }
                     Application.Run(f);
                 }
                 catch (Exception ex) { Log.Warn("status bubble: " + ex.Message); }
@@ -325,7 +364,7 @@ namespace GoodPizza
         public static void Close()
         {
             Form f;
-            lock (L) { f = _form; _form = null; _text = null; }
+            lock (L) { _closing = true; f = _form; _form = null; _text = null; }
             if (f == null) return;
             try { f.BeginInvoke(new Action(() => f.Close())); } catch { }
         }
@@ -379,6 +418,7 @@ namespace GoodPizza
                         Log.Warn("Exit chosen in the tray");
                         var h = OnExit; if (h != null) h();     // Program cancels the run
                         Notice.Close();
+                        Status.Close();
                         try { Application.Exit(); } catch { }
                     };
                     _menu.Items.Add(exit);
@@ -469,9 +509,11 @@ namespace GoodPizza
         static Form _form;
         static Label _detail, _rate;
         static ProgressBar _bar;
+        static bool _closing;
 
         public static void Show(string title)
         {
+            lock (L) { _closing = false; }
             var ready = new ManualResetEvent(false);
             var t = new Thread(() =>
             {
@@ -496,8 +538,21 @@ namespace GoodPizza
                     };
                     _rate = new Label { Left = 14, Top = 68, Width = 400, Height = 20, Text = "" };
                     f.Controls.Add(_detail); f.Controls.Add(_bar); f.Controls.Add(_rate);
-                    lock (L) { _form = f; }
-                    f.Shown += (s, e) => ready.Set();
+                    f.FormClosed += delegate(object s, FormClosedEventArgs e)
+                    {
+                        lock (L) { if (ReferenceEquals(_form, f)) _form = null; }
+                    };
+                    f.Shown += (s, e) =>
+                    {
+                        bool c; lock (L) { c = _closing; }
+                        if (c) { try { f.Close(); } catch { } }
+                        ready.Set();
+                    };
+                    lock (L)
+                    {
+                        if (_closing) { ready.Set(); return; }   // finished while starting
+                        _form = f;
+                    }
                     Application.Run(f);
                 }
                 catch (Exception ex) { Log.Warn("progress window: " + ex.Message); }
@@ -534,7 +589,8 @@ namespace GoodPizza
                     if (mbPerSec > 0.05 && total > done) left = (total - done) / (mbPerSec * 1048576.0);
                     _rate.Text = mbPerSec.ToString("0.0", CultureInfo.InvariantCulture) + " MB/s" +
                         (left > 0
-                            ? "   -   about " + left.ToString("0", CultureInfo.InvariantCulture) + " s left"
+                            // "about 87000 s left" was unreadable on a slow link
+                            ? "   -   about " + TimeSpan.FromSeconds(left).ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture) + " left"
                             : "");
                 }));
             }
@@ -552,7 +608,7 @@ namespace GoodPizza
 
         public static void Finish()
         {
-            Form f; lock (L) { f = _form; _form = null; }
+            Form f; lock (L) { _closing = true; f = _form; _form = null; }
             if (f == null) return;
             try { f.BeginInvoke(new Action(() => { try { f.Close(); } catch { } })); }
             catch { }
@@ -575,17 +631,23 @@ namespace GoodPizza
 
         public bool BootFinished;
         public bool GameInstalled;
+        public bool SawRemoval;        // a removal line landed in THIS poll
 
         static readonly TimeSpan Rx = TimeSpan.FromSeconds(2);
         static readonly string Pkg = Regex.Escape(Program.GamePackage);   // dots are metacharacters
 
         // Only lines that tie the package to an on-device path or a running process count;
         // a bare mention is NOT proof (opening the store listing logs market://...id=<pkg>).
+        // The on-device path forms require the committed "<pkg>-" directory shape: a
+        // staging directory that merely contains the package id is not proof of install
+        // yet, and treating it as one made the launcher launch a game that was not there.
         static readonly Regex InstalledRx = new Regex(
-            "(/data/app/\\S*" + Pkg + "|Start proc \\S+.*" + Pkg + "|dexopt.*" + Pkg + "|Package \\[" + Pkg + "\\])",
+            "(/data/app/\\S*" + Pkg + "-|Start proc \\S+.*" + Pkg + "|dexopt[^\\n]*/" + Pkg + "-|Package \\[" + Pkg + "\\])",
             RegexOptions.Compiled, Rx);
         static readonly Regex RemovedRx = new Regex(
-            "(removing package|package removed|deleting package|uninstall)",
+            "(removing package|package removed|deleting package)[^\\n]*" + Pkg +
+            "|uninstall[^\\n]*" + Pkg +
+            "|/" + Pkg + "[^\\n]*remov",
             RegexOptions.Compiled | RegexOptions.IgnoreCase, Rx);
 
         public LogWatcher(DateTime floorUtc) { _floorUtc = floorUtc; }
@@ -608,7 +670,14 @@ namespace GoodPizza
                 var files = new DirectoryInfo(LogcatDir).GetFiles("*.log")
                     .Where(f => f.LastWriteTimeUtc >= _floorUtc)
                     .OrderBy(f => f.LastWriteTimeUtc).ToArray();
-                foreach (var f in files) ReadNew(f);
+                foreach (var f in files)
+                {
+                    // Per file, not per poll: one log WSA still holds open used to abort
+                    // the whole scan, so newer files' "Boot is finished" and install
+                    // evidence were never read at all.
+                    try { ReadNew(f); }
+                    catch (Exception ex) { Log.Warn("  logcat watcher: " + f.Name + ": " + ex.Message); }
+                }
             }
             catch (Exception ex) { Log.Warn("  logcat watcher: " + ex.Message); }
         }
@@ -654,6 +723,7 @@ namespace GoodPizza
                 {
                     if (GameInstalled) Log.Info("  logcat: removal evidence for " + Program.GamePackage);
                     GameInstalled = false;
+                    SawRemoval = true;
                 }
                 else if (InstalledRx.IsMatch(line))
                 {
@@ -714,7 +784,15 @@ namespace GoodPizza
             bool created;
             Mutex mtx = null;
             try { mtx = new Mutex(true, "Global\\GoodPizzaGreatPizzaLauncher", out created); }
-            catch (Exception ex) { Log.Warn("single-instance mutex: " + ex.Message); created = true; }
+            catch (Exception ex)
+            {
+                // Assuming exclusivity after a FAILURE was backwards: if the mutex cannot
+                // be created a second instance may well own it, and two writers on one
+                // .part file corrupt the download.
+                Log.Err("single-instance mutex: " + ex.Message);
+                Log.Close();
+                return 2;
+            }
             if (!created)
             {
                 Log.Warn("another launcher instance is already running; exiting");
@@ -725,7 +803,7 @@ namespace GoodPizza
             }
 
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; Cancelled = true; };
-            AppDomain.CurrentDomain.ProcessExit += (s, e) => { Cancelled = true; Notice.Close(); Tray.Stop(); CleanupTemp(); Log.Close(); };
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => { Cancelled = true; Notice.Close(); Status.Close(); Tray.Stop(); CleanupTemp(); Log.Close(); };
 
             Tray.OnExit = () => { Cancelled = true; };   // menu "Exit launcher" == Ctrl+C
             Tray.Start();
@@ -868,9 +946,24 @@ namespace GoodPizza
 
         static bool Open(string uri)
         {
-            try { using (Process.Start(new ProcessStartInfo(uri) { UseShellExecute = true })) { } return true; }
-            catch (Exception ex) { Log.Warn("  could not open " + uri + ": " + ex.Message); return false; }
+            // Shell activation is unbounded by nature: a stalled Explorer or hung
+            // protocol handler used to block the main flow here indefinitely.
+            bool ok = false;
+            string err = null;
+            if (!_open.Run(delegate
+            {
+                try { using (Process.Start(new ProcessStartInfo(uri) { UseShellExecute = true })) { } ok = true; }
+                catch (Exception ex) { err = ex.Message; }
+            }, 5000, "shell open"))
+            {
+                Log.Warn("  could not open " + uri + ": the shell did not answer within 5 s");
+                return false;
+            }
+            if (!ok) Log.Warn("  could not open " + uri + ": " + err);
+            return ok;
         }
+
+        static readonly Bounded _open = new Bounded();
 
         // PowerShell must be 64-bit: under WOW64 the Hyper-V module, optional-feature and
         // package cmdlets misbehave. Sysnative reaches the 64-bit one from a 32-bit exe.
@@ -913,19 +1006,46 @@ namespace GoodPizza
                     p.Start();
                     p.BeginOutputReadLine();
                     p.BeginErrorReadLine();
-                    if (!p.WaitForExit(timeoutMs))
+                    var sw = Stopwatch.StartNew();
+                    while (true)
                     {
-                        try { p.Kill(); } catch { }
-                        Log.Warn("timeout on [" + tag + "] after " + timeoutMs + " ms");
-                        lock (sb) output = sb.ToString();
-                        return false;
+                        if (p.WaitForExit(200)) break;
+                        // Cancel must be observed HERE: tray "Exit" during a long 7-Zip
+                        // extraction or package registration used to set Cancelled while
+                        // nothing in this wait ever read it - the launcher kept running.
+                        if (Cancelled)
+                        {
+                            try { p.Kill(); } catch { }
+                            Log.Warn("cancelled while running [" + tag + "]");
+                            throw new OperationCanceledException();
+                        }
+                        if (sw.ElapsedMilliseconds > timeoutMs)
+                        {
+                            try { p.Kill(); } catch { }
+                            Log.Warn("timeout on [" + tag + "] after " + timeoutMs + " ms");
+                            lock (sb) output = sb.ToString();
+                            return false;
+                        }
                     }
-                    p.WaitForExit();    // drain async readers
+                    // Drain the async readers, bounded. The parameterless WaitForExit
+                    // waits for the pipes to close, and a grandchild that inherited the
+                    // handles keeps them open forever - no failure window, no tray stop,
+                    // only Task Manager. Quiet for 300 ms (2 s cap) is close enough.
+                    var drainUntil = Environment.TickCount + 2000;
+                    int lastLen = -1, quiet = 0;
+                    while (Environment.TickCount < drainUntil)
+                    {
+                        int len; lock (sb) len = sb.Length;
+                        if (len == lastLen) { if (++quiet >= 6) break; }
+                        else { quiet = 0; lastLen = len; }
+                        Thread.Sleep(50);
+                    }
                     lock (sb) output = sb.ToString();
                     if (p.ExitCode != 0) Log.Info("[" + tag + "] exit=" + p.ExitCode);
                     return p.ExitCode == 0;
                 }
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 Log.Warn("[" + tag + "] could not run " + exe + ": " + ex.Message);
@@ -941,8 +1061,12 @@ namespace GoodPizza
                 using (var c = new TcpClient())
                 {
                     var r = c.BeginConnect("127.0.0.1", port, null, null);
-                    if (!r.AsyncWaitHandle.WaitOne(700, false)) return false;   // Dispose cancels the connect
-                    try { c.EndConnect(r); return true; } catch { return false; }
+                    try
+                    {
+                        if (!r.AsyncWaitHandle.WaitOne(700, false)) return false;   // Dispose cancels the connect
+                        try { c.EndConnect(r); return true; } catch { return false; }
+                    }
+                    finally { try { r.AsyncWaitHandle.Close(); } catch { } }   // polled in tight loops: no leak
                 }
             }
             catch { return false; }
@@ -1048,7 +1172,8 @@ namespace GoodPizza
             }
 
             Log.Info("WSA is not installed at " + Cfg.WsaRoot + "; it must be downloaded");
-            Directory.CreateDirectory(Cfg.CacheDir);
+            try { Directory.CreateDirectory(Cfg.CacheDir); }
+            catch (Exception ex) { return Fail("cannot create cache dir " + Cfg.CacheDir + ": " + Describe(ex)); }
 
             string archive;
             if (!ObtainArchive(out archive)) return false;
@@ -1069,18 +1194,32 @@ namespace GoodPizza
             {
                 // Offline? A previously downloaded archive can still be used.
                 var cached = FindCachedArchive();
+                if (cached != null && !SidecarOk(cached))
+                {
+                    Log.Warn("cached archive failed its recorded fingerprint; discarding " + cached);
+                    try { File.Delete(cached); } catch { }
+                    try { File.Delete(cached + ".sha256"); } catch { }
+                    cached = null;
+                }
                 if (cached != null)
                 {
                     Log.Warn("using cached archive without verification: " + cached);
+                    if (!NeedSpace(new FileInfo(cached).Length)) return false;
                     archive = cached; return true;
                 }
                 return Fail("could not find a WSA download (" + discoverErr + "). Check your connection or set WsaUrl in launcher.config");
             }
 
             var target = Path.Combine(Cfg.CacheDir, a.Name);
-            if (File.Exists(target) && CacheValid(target, a))
+            bool okCached = false;
+            // Hashing can throw if AV/indexer holds the file - that must degrade to
+            // "re-download", not kill the run with "file is being used by another process".
+            try { okCached = File.Exists(target) && CacheValid(target, a); }
+            catch (Exception ex) { Log.Warn("cached archive unreadable: " + Describe(ex)); }
+            if (okCached)
             {
                 Log.Ok("verified cached archive: " + target);
+                if (!NeedSpace(new FileInfo(target).Length)) return false;   // cached path: disk check used to be skipped
                 archive = target; return true;
             }
 
@@ -1113,8 +1252,13 @@ namespace GoodPizza
             try
             {
                 return new DirectoryInfo(Cfg.CacheDir).GetFiles()
-                    .Where(f => f.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) ||
-                                f.Name.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
+                    .Where(f => (f.Name.EndsWith(".7z", StringComparison.OrdinalIgnoreCase) ||
+                                 f.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) &&
+                                // Not "any archive in the cache": platform-tools.zip is
+                                // written by OptionalAdb and is normally the NEWEST file,
+                                // so offline it used to be selected as the WSA build,
+                                // extracted to a tree with no manifest, and never deleted.
+                                f.Length > 100L * 1048576)
                     .OrderByDescending(f => f.LastWriteTimeUtc).Select(f => f.FullName).FirstOrDefault();
             }
             catch { return null; }
@@ -1125,8 +1269,42 @@ namespace GoodPizza
             if (!string.IsNullOrEmpty(a.Sha256))
                 return Sha256Of(path).Equals(a.Sha256, StringComparison.OrdinalIgnoreCase);
             if (a.Size > 0) return new FileInfo(path).Length == a.Size;
-            Log.Warn("cached archive cannot be verified (no hash or size)");
-            return true;
+            // No published identity: fall back to the fingerprint WE recorded when this
+            // file was downloaded, so a later run still notices a truncated or swapped
+            // cache. Returning true here (the old behaviour) trusted whatever sat at
+            // this path forever, and there is no size gate to catch it either.
+            var side = path + ".sha256";
+            if (File.Exists(side))
+            {
+                var rec = SafeReadAllText(side).Trim();
+                if (rec.Length != 64) return false;
+                return Sha256Of(path).Equals(rec, StringComparison.OrdinalIgnoreCase);
+            }
+            Log.Warn("cached archive has no published hash, no size, and no recorded fingerprint - not reusing it");
+            return false;
+        }
+
+        // Offline companion to CacheValid: no Asset exists at all, so the recorded
+        // fingerprint is the only identity available. No sidecar (a cache written by an
+        // older version) is accepted - refusing it would make the offline path dead.
+        static bool SidecarOk(string path)
+        {
+            try
+            {
+                var side = path + ".sha256";
+                if (!File.Exists(side)) return true;
+                var rec = SafeReadAllText(side).Trim();
+                if (rec.Length != 64) return false;
+                return Sha256Of(path).Equals(rec, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return true; }
+        }
+
+        static string SafeReadAllText(string path)
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fs, Encoding.UTF8))
+                return sr.ReadToEnd();
         }
 
         // Ask before downloading several GB (and, for .7z, a small extractor).
@@ -1492,7 +1670,21 @@ namespace GoodPizza
                 catch (Exception ex)
                 {
                     var hr = (ex as WebException) != null ? ((WebException)ex).Response as HttpWebResponse : null;
-                    if (hr != null && (int)hr.StatusCode == 404) throw new InvalidOperationException("repository " + Cfg.Repo + " not found (HTTP 404)");
+                    if (hr != null)
+                    {
+                        var code = (int)hr.StatusCode;
+                        var left = hr.Headers["X-RateLimit-Remaining"];
+                        var reset = hr.Headers["X-RateLimit-Reset"];
+                        try { hr.Close(); } catch { }
+                        if (code == 404) throw new InvalidOperationException("repository " + Cfg.Repo + " not found (HTTP 404)");
+                        // A rate-limited shared IP used to be retried blindly, then reported
+                        // as an internet problem - and it pushes the run into the unverified
+                        // cache path.
+                        if (code == 403 || code == 429)
+                            throw new InvalidOperationException("GitHub said no (HTTP " + code + ", " +
+                                (left == "0" ? "rate limit reached, reset at epoch " + (reset ?? "?")
+                                             : "access denied") + "); retry later or set GITHUB_TOKEN");
+                    }
                     Log.Warn("  attempt " + i + ": " + Describe(ex));
                     if (i == 3) throw;
                     Wait(2000 * i);
@@ -1570,7 +1762,13 @@ namespace GoodPizza
         static long Free(string path)
         {
             try { return new DriveInfo(Path.GetPathRoot(Path.GetFullPath(path))).AvailableFreeSpace; }
-            catch { return long.MaxValue; }
+            catch (Exception ex)
+            {
+                // Returning "infinite" silently disables the pre-check; say so, so a later
+                // "disk full" is not a mystery.
+                Log.Warn("free space unknown for " + path + ": " + ex.Message);
+                return long.MaxValue;
+            }
         }
 
         // archive on the cache drive; extraction (~3x, refined exactly for .zip later) on the WSA drive
@@ -1637,6 +1835,14 @@ namespace GoodPizza
 
                     if (File.Exists(dest)) File.Delete(dest);
                     File.Move(part, dest);
+                    // Record our own fingerprint: with no published hash this is the only
+                    // identity a later run will have to detect a corrupted cache.
+                    try
+                    {
+                        var fp = !string.IsNullOrEmpty(expectedSha) ? expectedSha : Sha256Of(dest);
+                        File.WriteAllText(dest + ".sha256", fp);
+                    }
+                    catch { }
                     Log.Ok("downloaded " + label + " -> " + dest);
                     return true;
                 }
@@ -1644,9 +1850,20 @@ namespace GoodPizza
                 catch (Exception ex)
                 {
                     if (IsDiskFull(ex)) return Fail("disk full while downloading " + label);
+                    // Permanent I/O problems are not transient: retrying a denied ACL or a
+                    // cache path that exists as a FILE just burned 4+8+16+32 s of backoff
+                    // and reported it as a network failure.
+                    if (ex is UnauthorizedAccessException || ex is DirectoryNotFoundException ||
+                        ex is System.Security.SecurityException)
+                        return Fail("cannot write " + Cfg.CacheDir + ": " + ex.Message);
                     var hr = (ex as WebException) != null ? ((WebException)ex).Response as HttpWebResponse : null;
-                    if (hr != null && ((int)hr.StatusCode == 404 || (int)hr.StatusCode == 410))
-                        return Fail("download URL is gone (HTTP " + (int)hr.StatusCode + "): " + url);
+                    if (hr != null)
+                    {
+                        var code = (int)hr.StatusCode;
+                        try { hr.Close(); } catch { }        // pool holds 2 connections per host
+                        if (code == 404 || code == 410)
+                            return Fail("download URL is gone (HTTP " + code + "): " + url);
+                    }
                     Log.Warn("  download problem: " + Describe(ex));
                     if (attempt == maxAttempts) return Fail("download failed after " + maxAttempts + " attempts: " + Describe(ex));
                     Wait(Math.Min(60000, 2000 << attempt));     // 4s, 8s, 16s, 32s
@@ -1694,6 +1911,21 @@ namespace GoodPizza
             using (resp)
             {
                 var resumed = have > 0 && resp.StatusCode == HttpStatusCode.PartialContent;
+                if (resumed)
+                {
+                    // Status 206 alone does not prove OUR range came back: a proxy can
+                    // answer with a different one, and appending at the wrong offset
+                    // yields a file of exactly the expected length that is pure garbage.
+                    var cr = resp.Headers["Content-Range"];
+                    var dash = cr == null ? -1 : cr.IndexOf('-');
+                    long start;
+                    if (cr == null || dash < 6 || !long.TryParse(cr.Substring(6, dash - 6), out start) || start != have)
+                    {
+                        Log.Warn("  server answered with a different byte range - restarting from zero");
+                        try { File.Delete(part); } catch { }
+                        throw new IOException("resume range not honoured; restarting from zero");
+                    }
+                }
                 if (!resumed) have = 0;
                 long total = resp.ContentLength >= 0 ? have + resp.ContentLength : expectedSize;
                 Log.Info(resumed ? "  resuming at " + Size(have) : "  starting; size " + (total > 0 ? Size(total) : "unknown"));
@@ -1783,6 +2015,12 @@ namespace GoodPizza
                 Log.Ok("WSA installed to " + root);
                 return true;
             }
+            catch (UnauthorizedAccessException ex)
+            {
+                // Path exists as a FILE, or a deny ACL from an older install under
+                // another user: not an IO problem, and it needs its own message.
+                return Fail("no permission to write " + root + ": " + ex.Message);
+            }
             catch (IOException ex)
             {
                 // One catch with a branch, not two catch clauses: without C# 6
@@ -1863,11 +2101,51 @@ namespace GoodPizza
                 if (!DownloadFile("https://www.7-zip.org/a/7zr.exe", target, -1, "", "7zr.exe")) return false;
                 exe = target;
             }
+            // No published checksum for 7zr.exe, so at least prove it is a plausible
+            // program file before running it - a captive portal's HTML page would
+            // otherwise sit in the cache and fail identically forever.
+            if (string.Equals(Path.GetFileName(exe), "7zr.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                string why;
+                if (!PlausiblePe(exe, out why))
+                {
+                    try { File.Delete(exe); } catch { }
+                    return Fail("the unpacker (7zr.exe) is unusable (" + why + "); it was deleted - re-run to download it again");
+                }
+            }
             Log.Info("extracting with " + exe);
             string o;
             if (!Run(exe, "x \"" + archive + "\" -o\"" + dest + "\" -y", "7z extract", 60 * 60 * 1000, out o))
+            {
+                // A damaged archive fails this way on EVERY run while the cache still
+                // validates on size alone (offline path) - discard it so the next run
+                // downloads a fresh copy instead of looping forever.
+                var msg = o ?? "";
+                if (msg.IndexOf("Cannot open", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    msg.IndexOf("CRC Failed", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    msg.IndexOf("Headers Error", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    msg.IndexOf("Unexpected end of", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    try { File.Delete(archive); } catch { }
+                    return Fail("the cached archive is damaged and was deleted: " + Tail(o) + " - re-run to download it again");
+                }
                 return Fail("7-Zip extraction failed: " + Tail(o));
+            }
             return true;
+        }
+
+        static bool PlausiblePe(string path, out string why)
+        {
+            why = null;
+            try
+            {
+                using (var fs = File.OpenRead(path))
+                    if (fs.ReadByte() != 'M' || fs.ReadByte() != 'Z') { why = "not a program file"; return false; }
+                var len = new FileInfo(path).Length;
+                if (len < 100000) { why = "only " + len + " bytes"; return false; }
+                return true;
+            }
+            catch (Exception ex) { why = ex.Message; return false; }
         }
 
         static string Tail(string s) { s = (s ?? "").Trim(); return s.Length > 300 ? s.Substring(s.Length - 300) : s; }
@@ -1881,7 +2159,13 @@ namespace GoodPizza
                 var zip = Path.Combine(Cfg.CacheDir, "platform-tools.zip");
                 if (DownloadFile("https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
                                  zip, -1, "", "platform-tools"))
+                {
+                    // ExtractToDirectory refuses an existing directory: a second run threw,
+                    // the blanket catch swallowed it, and a corrupt cached zip never healed.
+                    var pt = Path.Combine(Cfg.CacheDir, "platform-tools");
+                    if (Directory.Exists(pt)) Directory.Delete(pt, true);
                     ZipFile.ExtractToDirectory(zip, Cfg.CacheDir);
+                }
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex) { Log.Warn("optional adb download skipped: " + ex.Message); }
@@ -2220,9 +2504,19 @@ namespace GoodPizza
                             catch (Exception ex) { Log.Warn(tag + ": " + ex.Message); }
                             finally { lock (_l) { _busy = false; } }
                         });
-                        t.IsBackground = true;
-                        t.SetApartmentState(ApartmentState.STA);
-                        t.Start();
+                        try
+                        {
+                            t.IsBackground = true;
+                            t.SetApartmentState(ApartmentState.STA);
+                            t.Start();
+                        }
+                        // A failed Start used to leave _busy latched forever, wedging
+                        // this slot so every later probe timed out on stale data.
+                        catch (Exception ex)
+                        {
+                            t = null; _busy = false;
+                            Log.Warn(tag + ": could not start helper thread: " + ex.Message);
+                        }
                     }
                 }
                 bool ok;
@@ -2319,7 +2613,10 @@ namespace GoodPizza
             var res = Click.NoDialog;
             if (_consent.Run(() => { res = TryClickContinueCore(); }, 5000, "consent dialog probe"))
                 return res;
-            return Click.NoDialog;
+            // Overrun: "no dialog" could not be PROVEN while the probe was stuck, and
+            // reporting it as such silenced the "click Continue" notice - the run then
+            // ended at the 30-minute timeout with the wrong error.
+            return Click.Failed;
         }
 
         static Click TryClickContinueCore()
@@ -2341,7 +2638,18 @@ namespace GoodPizza
                         {
                             if (w.Current.ClassName != "#32770") continue;
                             seen = true;
-                            Log.Info("  found dialog '" + w.Current.Name + "' (pid " + p.Id + ")");
+                            var title = w.Current.Name ?? "";
+                            Log.Info("  found dialog '" + title + "' (pid " + p.Id + ")");
+                            // Only the first-run consent dialog may be confirmed without
+                            // the user seeing it: any other #32770 dialog with a button
+                            // named "Continue" used to be silently approved. `seen` still
+                            // counts so an unmatched (e.g. localised) title still raises
+                            // the notice instead of failing silently.
+                            if (title.IndexOf("Optional diagnostic data", StringComparison.OrdinalIgnoreCase) < 0)
+                            {
+                                Log.Warn("  not the first-run consent dialog - leaving it alone");
+                                continue;
+                            }
                             var btn = w.FindFirst(TreeScope.Descendants,
                                 new PropertyCondition(AutomationElement.NameProperty, "Continue"));
                             object inv;
@@ -2406,13 +2714,19 @@ namespace GoodPizza
                 {
                     lastClick = sw.ElapsedMilliseconds;
                     var c = TryClickContinue();
-                    if (c == Click.Failed && !noticed)
+                    if (c == Click.Failed)
                     {
-                        noticed = true;
-                        Notice.Show("Good Pizza launcher - action needed",
-                            "A Windows Subsystem for Android dialog is waiting.\r\nPlease click 'Continue'.");
+                        if (!noticed)
+                        {
+                            noticed = true;
+                            Notice.Show("Good Pizza launcher - action needed",
+                                "A Windows Subsystem for Android dialog is waiting.\r\nPlease click 'Continue'.");
+                        }
                     }
-                    else if (c == Click.Clicked) { Notice.Close(); }
+                    // Closed on Clicked AND on a clean "no dialog": the user may have
+                    // clicked Continue by hand, in which case the probe returns
+                    // NoDialog and the notice used to stay up for the rest of boot.
+                    else if (noticed) { noticed = false; Notice.Close(); }
                 }
 
                 watcher.Poll();
@@ -2480,18 +2794,31 @@ namespace GoodPizza
             if (adb == null || !PortOpen(AdbPort)) { _adbConnected = false; return false; }
             if (_adbConnected) return true;
             string o;
-            Run(adb, "connect " + Serial, "adb connect", 15000, out o);
-            Log.Info("  adb connect: " + o.Trim());
-            _adbConnected = o.IndexOf("connected", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!Run(adb, "connect " + Serial, "adb connect", 15000, out o))
+            { _adbConnected = false; return false; }
+            o = (o ?? "").Trim();
+            Log.Info("  adb connect: " + o);
+            // "connected" on its own also matches failure text ("the connected party did
+            // not properly respond"), which used to latch the cache on a dead bridge.
+            _adbConnected = o.StartsWith("connected to", StringComparison.OrdinalIgnoreCase)
+                         || o.StartsWith("already connected", StringComparison.OrdinalIgnoreCase);
             return _adbConnected;
         }
 
+        // null = the bridge is unavailable or the command failed; "" = it ran and printed
+        // nothing. Callers must not read error text as if it were command output - an
+        // "error: device offline" line used to count as a set getprop and skipped the
+        // ASTC fix, and as evidence in GameInstalled.
         static string Adb(string args, int timeoutMs)
         {
-            if (!AdbReady()) return "";
+            if (!AdbReady()) return null;
             string o;
-            Run(AdbPath, "-s " + Serial + " " + args, "adb " + args, timeoutMs, out o);
-            return o.Trim();
+            if (!Run(AdbPath, "-s " + Serial + " " + args, "adb " + args, timeoutMs, out o))
+            { _adbConnected = false; return null; }   // a failing command drops the cache
+            o = (o ?? "").Trim();
+            if (o.StartsWith("error:", StringComparison.OrdinalIgnoreCase))
+            { _adbConnected = false; return null; }   // "device not found" / "offline"
+            return o;
         }
 
         // ----------------------------------------- 10. Play Store + game install
@@ -2499,18 +2826,67 @@ namespace GoodPizza
         // dies ("Process com.android.vending has died"), so this is a wait-on-user step.
         // One shared timeout and one strategy: re-submit market:// only while no Android
         // window is visible; once the store is on screen, leave the user alone.
+        static string InstallMarker { get { return Path.Combine(Cfg.WsaRoot, ".gp-game"); } }
+
         static bool GameInstalled()
         {
-            var outp = Adb("shell pm list packages " + GamePackage, 20000);
-            if (outp.IndexOf(GamePackage, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            // 5s, not 20s: this runs inside a 3-second poll, and one slow call used to
+            // stretch an iteration to ~36s. The verdict is an exact line match - a raw
+            // substring test also matched any package that merely CONTAINS this id.
+            var outp = Adb("shell pm list packages " + GamePackage, 5000);
+            if (outp != null)
+                foreach (var l in outp.Split('\n'))
+                    if (l.Trim() == "package:" + GamePackage) return RememberInstalled();
+
             var w = Watcher();
             w.Poll();
-            return w.GameInstalled;
+            if (w.SawRemoval) TryDeleteInstallMarker();     // uninstalled this run
+            if (w.GameInstalled) return RememberInstalled();
+
+            // Durable evidence for a LATER run: with developer mode off there is no adb,
+            // and the log floor excludes last session's logcat, so a game installed by a
+            // previous run read as "not installed" and burned the whole 30 minutes.
+            if (File.Exists(InstallMarker)) return true;
+            return false;
+        }
+
+        static bool RememberInstalled()
+        {
+            try
+            {
+                if (!File.Exists(InstallMarker)) File.WriteAllText(InstallMarker, GamePackage);
+            }
+            catch (Exception ex) { Log.Warn("  could not write install marker: " + ex.Message); }
+            return true;
+        }
+
+        static void TryDeleteInstallMarker()
+        {
+            try { if (File.Exists(InstallMarker)) File.Delete(InstallMarker); }
+            catch (Exception ex) { Log.Warn("  could not clear install marker: " + ex.Message); }
+        }
+
+        // Constraint 2: the game comes from the Play Store. This launcher never
+        // sideloads - there is no adb install anywhere, only market:// and wsa:// -
+        // but a copy the USER sideloaded is named in the log instead of passing
+        // silently. Informational on purpose: blocking here would stop the player
+        // from launching a game they deliberately installed themselves.
+        static void CheckInstaller()
+        {
+            var d = Adb("shell dumpsys package " + GamePackage, 10000);
+            if (d == null) { Log.Info("installer: unknown (adb not available)"); return; }
+            var m = Regex.Match(d, "installerPackageName=([^\\s]+)");
+            if (!m.Success) { Log.Info("installer: not reported by this Android build"); return; }
+            var inst = m.Groups[1].Value.Trim().TrimEnd(',', ';');
+            if (string.Equals(inst, PlayStore, StringComparison.OrdinalIgnoreCase))
+                Log.Ok("installer: " + inst + " (Play Store)");
+            else
+                Log.Warn("installer: " + inst + " - NOT the Play Store; this copy was installed outside the store");
         }
 
         static bool EnsureStoreAndGame()
         {
-            if (GameInstalled()) { Log.Ok("game already installed"); return true; }
+            if (GameInstalled()) { Log.Ok("game already installed"); CheckInstaller(); return true; }
 
             Log.Info("opening Play Store listing: market://details?id=" + GamePackage);
             Log.Info("Google sign-in is the user's step - we wait, we never enter credentials");
@@ -2532,9 +2908,13 @@ namespace GoodPizza
                     var win = AndroidWindowPresent();
                     if (win && !sawWindow) { sawWindow = true; Log.Ok("Play Store surface visible after " + (sw.ElapsedMilliseconds / 1000) + "s"); Status.Close(); }
 
-                    if (!win && sw.ElapsedMilliseconds - lastFire >= StoreRefireMs)
+                    // Fire at least once, always: on a re-run with an Android window
+                    // already up (the store left open from last run), `win` was true from
+                    // the first iteration, market:// was never submitted, and the user
+                    // was told to tap Install on a page that never opened.
+                    if (fired == 0 || (!win && sw.ElapsedMilliseconds - lastFire >= StoreRefireMs))
                     {
-                        Status.Show("Launching the Play Store...");
+                        if (!win) Status.Show("Launching the Play Store...");   // already visible: no bubble
                         if (!Open("market://details?id=" + GamePackage))
                             return Fail("market:// activation failed; no protocol handler for the Play Store");
                         fired++;
@@ -2547,6 +2927,7 @@ namespace GoodPizza
                     if (GameInstalled())
                     {
                         Log.Ok("game installed after " + N(sw.Elapsed.TotalMinutes) + " minutes");
+                        CheckInstaller();
                         return true;
                     }
                     // One line per whole minute, numbered from the clock. The number is
@@ -2577,9 +2958,19 @@ namespace GoodPizza
             // developer bridge, which a virgin image does not expose, so best-effort only.
             if (AdbReady())
             {
-                var cur = Adb("shell getprop debug.require_split", 15000);
-                if (cur.Length > 0) Log.Info("  debug.require_split already = " + cur);
-                else Log.Info("  setprop -> " + Adb("shell setprop debug.require_split split_config.etc1_rgb8_group_hd.apk", 15000));
+                const string want = "split_config.etc1_rgb8_group_hd.apk";
+                var cur = Adb("shell getprop debug.require_split", 5000);
+                if (cur == null) Log.Info("ASTC texture split skipped (adb not responding)");
+                else if (cur == want) Log.Info("  debug.require_split already = " + cur);
+                else
+                {
+                    // Compare against the DESIRED value, not "non-empty": any stale value
+                    // used to count as applied and the broken-graphics fix was skipped.
+                    Adb("shell setprop debug.require_split " + want, 5000);
+                    var back = Adb("shell getprop debug.require_split", 5000);
+                    if (back == want) Log.Ok("  debug.require_split = " + back);
+                    else Log.Warn("  ASTC fix not applied (read back: '" + (back ?? "n/a") + "')");
+                }
             }
             else Log.Info("ASTC texture split skipped (adb bridge not available)");
 
@@ -2621,6 +3012,11 @@ namespace GoodPizza
         // ------------------------------------------------------ fail window
         static void ShowFailureWindow(string check, string cause, string hint)
         {
+            // This is the funnel every failure path comes through (and it blocks in
+            // Application.Run below) - nothing may outlive it, above all the TopMost
+            // "Launching..." bubble, which would then sit over the failure window.
+            Notice.Close();
+            Status.Close();
             try
             {
                 var form = new Form

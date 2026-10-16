@@ -3,9 +3,10 @@
 // Check-first provisioning. Every dependency is verified before anything is
 // installed, every action is written to launcher.log with a timestamp, and the
 // failure window only appears if a check fails - naming the check, the cause
-// and a suggested fix. The only other UI is (a) a Yes/No question before WSA is
-// downloaded and (b) a small non-blocking notice when the USER must act
-// (Google sign-in, consent dialog).
+// and a suggested fix. The only other UI is (a) the two Yes/No questions, asked
+// up front before anything is downloaded - Developer Mode, then WSA itself - and
+// (b) a small non-blocking notice when the USER must act (Google sign-in,
+// consent dialog).
 //
 // Hard constraints this file encodes (do not break):
 //   1. Boot goes through protocol activation (wsa://). WsaClient.exe is never
@@ -680,6 +681,7 @@ namespace GoodPizza
                 new StepDef("Administrator rights", CheckAdmin, "Right-click the launcher and choose 'Run as administrator'."),
                 new StepDef("Windows 11", CheckWindows11, "WSA needs Windows 11 (build 22000 or newer). Update Windows."),
                 new StepDef("virtualization", CheckVirtualization, "Enable virtualization (VT-x/AMD-V/SVM) in BIOS, enable 'Virtual Machine Platform', then reboot."),
+                new StepDef("Developer Mode", EnsureDeveloperMode, "Turn on Settings > System > For developers > Developer Mode, then re-run."),
                 new StepDef("WSA payload", EnsurePayload, "Check your internet connection and free disk space, or set WsaUrl in launcher.config."),
                 new StepDef("WSA dependencies", EnsureDependencies, "Re-run; if it persists, delete C:\\WSA so it is downloaded again."),
                 new StepDef("WSA registration", EnsureRegistered, "Make sure no other WSA copy is registered; run 'Get-AppxPackage *WindowsSubsystemForAndroid* | Remove-AppxPackage' and retry."),
@@ -1074,9 +1076,17 @@ namespace GoodPizza
             if (a.Size > 0) Log.Info("download size: " + Gb(a.Size) + " (" + Size(a.Size) + ")");
             Log.Info("destination: " + Cfg.CacheDir + Path.DirectorySeparatorChar + a.Name);
 
+            // Unpacking a .7z needs a tool most PCs do not have. Instead of
+            // fetching it quietly halfway through, the question says so up front -
+            // the user approved a game, and this is a separate download that gets
+            // run as administrator with no published checksum to check it against.
+            var unpacker = a.Name.EndsWith(".7z", StringComparison.OrdinalIgnoreCase) && Find7z() == null
+                         ? "It also downloads a 1 MB tool to unpack it (7zr.exe)."
+                         : null;
+
             Log.Info("asking user to approve download of " + a.Name);
             Tray.SetStatus("waiting for your answer: download WSA?");
-            using (var d = new DownloadPrompt(a))
+            using (var d = new DownloadPrompt(a, unpacker))
             {
                 var r = d.ShowDialog();
                 Log.Info("user answered: " + r);
@@ -1084,16 +1094,157 @@ namespace GoodPizza
             }
         }
 
+        // ---- the prompts ---------------------------------------------------------
+        // Both questions used to be MessageBoxes, and both had the same two problems.
+        // A MessageBox cannot show a clickable source, and - because the launcher runs
+        // elevated - it opened *behind* whatever the user already had open, so a run
+        // could look like it had done nothing at all (observed here: a prompt hidden
+        // behind a maximised browser, while the launcher logged its hwnd). Every
+        // question in this file is therefore a real dialog, and Attention() gives it
+        // the chance a background window is allowed to ask for: it takes focus, and
+        // if something else holds focus it flashes its taskbar button.
+        //
+        // TopMost = true was not enough on its own. Measured, not assumed: the
+        // WS_EX_TOPMOST bit stayed clear, and it stayed clear for a plain test form
+        // too - on this box, with NVIDIA Overlay / Broadcast and Discord's overlay
+        // running, an ordinary app cannot enter the topmost band (SetWindowPos returns
+        // True and the bit never lands; the taskbar still manages it, so the mechanism
+        // itself works).
+        static void Attention(Form f)
+        {
+            SetWindowPos(f.Handle, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+            f.Activate();
+            // Form.Activate() returns void, so "did we get focus?" is answered by
+            // asking the OS who the foreground window actually is.
+            var activated = GetForegroundWindow() == f.Handle;
+            if (!activated)
+            {
+                var fi = new Flashwinfo();
+                fi.cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(Flashwinfo));
+                fi.hwnd = f.Handle;
+                fi.dwFlags = FlashAll;
+                fi.uCount = 6;
+                fi.dwTimeout = 0;
+                FlashWindowEx(ref fi);
+            }
+            Log.Info("prompt shown: hwnd=" + f.Handle + " activated=" + activated +
+                     " exstyle=0x" + GetWindowLong(f.Handle, GwlExstyle).ToString("x8"));
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int GetWindowLong(IntPtr hWnd, int index);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool FlashWindowEx(ref Flashwinfo pfwi);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct Flashwinfo
+        {
+            public uint cbSize;
+            public IntPtr hwnd;
+            public uint dwFlags;
+            public uint uCount;
+            public uint dwTimeout;
+        }
+
+        const int GwlExstyle = -20;
+        const uint FlashAll = 3;
+        static readonly IntPtr HwndTopmost = new IntPtr(-1);
+        const uint SwpNoMove = 0x0002, SwpNoSize = 0x0001, SwpNoActivate = 0x0010;
+
+        // ---- the Developer Mode question ------------------------------------------
+        // Asked before anything is downloaded, so a PC that has never been used for
+        // development gets both of its questions at the start instead of one at the
+        // start and one in the middle of the run.
+        sealed class AskPrompt : Form
+        {
+            public AskPrompt(string heading, string body)
+            {
+                Text = "Good Pizza, Great Pizza";
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                MaximizeBox = false;
+                MinimizeBox = false;
+                ShowInTaskbar = true;
+                TopMost = true;
+                StartPosition = FormStartPosition.Manual;
+                Font = new SD.Font("Segoe UI", 9F);
+                ClientSize = new SD.Size(430, 210);
+
+                try
+                {
+                    var ico = SD.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                    if (ico != null)
+                    {
+                        Icon = ico;
+                        Controls.Add(new PictureBox
+                        {
+                            Left = 18, Top = 16, Size = new SD.Size(34, 34),
+                            SizeMode = PictureBoxSizeMode.Zoom, Image = ico.ToBitmap()
+                        });
+                    }
+                }
+                catch { /* an icon is decoration; never let it stop the question */ }
+
+                var head = new Label
+                {
+                    Left = 62, Top = 16, Width = 352, AutoSize = true,
+                    Font = new SD.Font(Font, SD.FontStyle.Bold),
+                    ForeColor = SD.Color.FromArgb(32, 32, 32),
+                    Text = heading
+                };
+                var text = new Label
+                {
+                    Left = 62, Top = 58, Width = 352, AutoSize = true,
+                    ForeColor = SD.Color.FromArgb(88, 88, 88),
+                    Text = body
+                };
+
+                // The rule is placed under the whole paragraph, not at the height
+                // DownloadPrompt uses for its single-line body. This question runs
+                // to three lines (58..~105) and at y=94 the divider came down
+                // between lines two and three, which reads as a strikethrough.
+                Controls.Add(new Panel { Left = 18, Top = 132, Size = new SD.Size(394, 1), BackColor = SD.Color.FromArgb(228, 228, 228) });
+
+                var no = new Button { Text = "No", DialogResult = DialogResult.No, Size = new SD.Size(82, 28), Location = new SD.Point(330, 166) };
+                var yes = new Button
+                {
+                    Text = "Yes", DialogResult = DialogResult.Yes, Size = new SD.Size(82, 28),
+                    Location = new SD.Point(240, 166),
+                    Font = new SD.Font(Font, SD.FontStyle.Bold)
+                };
+                AcceptButton = yes;
+                CancelButton = no;
+
+                Controls.AddRange(new Control[] { head, text, no, yes });
+
+                // Same reason as DownloadPrompt: the primary display is not
+                // necessarily the one the user is looking at.
+                var wa = Screen.FromPoint(System.Windows.Forms.Cursor.Position).WorkingArea;
+                Location = new SD.Point(wa.Left + (wa.Width - Width) / 2, wa.Top + (wa.Height - Height) / 2);
+            }
+
+            protected override void OnShown(EventArgs e)
+            {
+                base.OnShown(e);
+                Attention(this);
+            }
+        }
+
         // ---- the download prompt -------------------------------------------------
-        // This used to be a MessageBox, which had two problems. It could not show a
-        // clickable source, and - because the launcher runs elevated - it opened
-        // *behind* whatever the user already had open, so a run could look like it had
-        // done nothing at all (observed here: a prompt hidden behind a maximised
-        // browser). A real dialog gets the source link, an always-on-top window, and
-        // the room to say what WSA is before asking for three quarters of a gigabyte.
+        // The room to say what WSA is before asking for three quarters of a gigabyte,
+        // with the source the user can check and the size in GB.
         sealed class DownloadPrompt : Form
         {
-            public DownloadPrompt(Asset a)
+            // extraNote is for the things that will also be downloaded. The user
+            // approved a game, not an unpacker, so when no 7-Zip is present the
+            // question says so before the run reaches Extract7z.
+            public DownloadPrompt(Asset a, string extraNote)
             {
                 Text = "Good Pizza, Great Pizza";
                 FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -1140,7 +1291,8 @@ namespace GoodPizza
                 {
                     Left = 62, Top = 58, Width = 352, AutoSize = true,
                     ForeColor = SD.Color.FromArgb(88, 88, 88),
-                    Text = "The game runs inside it. Download it now?"
+                    Text = "The game runs inside it. Download it now?" +
+                           (string.IsNullOrEmpty(extraNote) ? "" : Environment.NewLine + extraNote)
                 };
 
                 Controls.Add(new Panel { Left = 18, Top = 94, Size = new SD.Size(394, 1), BackColor = SD.Color.FromArgb(228, 228, 228) });
@@ -1180,64 +1332,11 @@ namespace GoodPizza
                 Location = new SD.Point(wa.Left + (wa.Width - Width) / 2, wa.Top + (wa.Height - Height) / 2);
             }
 
-            // Measured, not assumed. TopMost = true was not enough: the WS_EX_TOPMOST
-            // bit stayed clear, and it stayed clear for a plain test form too - on this
-            // box, with NVIDIA Overlay / Broadcast and Discord's overlay running, an
-            // ordinary app simply cannot enter the topmost band (SetWindowPos returns
-            // True and the bit never lands; the taskbar still manages it, so the
-            // mechanism itself works). So the prompt asks for attention the way any
-            // background window is allowed to: it takes focus, and if something else
-            // holds focus it flashes its taskbar button instead of sitting there
-            // silently, which is how an unanswered prompt used to look like the
-            // launcher doing nothing.
             protected override void OnShown(EventArgs e)
             {
                 base.OnShown(e);
-                SetWindowPos(Handle, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
-                Activate();
-                // Form.Activate() returns void, so "did we get focus?" is answered by
-                // asking the OS who the foreground window actually is.
-                var activated = GetForegroundWindow() == Handle;
-                if (!activated)
-                {
-                    var fi = new Flashwinfo();
-                    fi.cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(Flashwinfo));
-                    fi.hwnd = Handle;
-                    fi.dwFlags = FlashAll;
-                    fi.uCount = 6;
-                    fi.dwTimeout = 0;
-                    FlashWindowEx(ref fi);
-                }
-                Log.Info("prompt shown: hwnd=" + Handle + " activated=" + activated +
-                         " exstyle=0x" + GetWindowLong(Handle, GwlExstyle).ToString("x8"));
+                Attention(this);
             }
-
-            [System.Runtime.InteropServices.DllImport("user32.dll")]
-            static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
-
-            [System.Runtime.InteropServices.DllImport("user32.dll")]
-            static extern int GetWindowLong(IntPtr hWnd, int index);
-
-            [System.Runtime.InteropServices.DllImport("user32.dll")]
-            static extern bool FlashWindowEx(ref Flashwinfo pfwi);
-
-            [System.Runtime.InteropServices.DllImport("user32.dll")]
-            static extern IntPtr GetForegroundWindow();
-
-            [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-            struct Flashwinfo
-            {
-                public uint cbSize;
-                public IntPtr hwnd;
-                public uint dwFlags;
-                public uint uCount;
-                public uint dwTimeout;
-            }
-
-            const int GwlExstyle = -20;
-            const uint FlashAll = 3;
-            static readonly IntPtr HwndTopmost = new IntPtr(-1);
-            const uint SwpNoMove = 0x0002, SwpNoSize = 0x0001, SwpNoActivate = 0x0010;
 
             static Label Caption(string text, int top)
             {
@@ -1497,7 +1596,13 @@ namespace GoodPizza
 
             var req = (HttpWebRequest)WebRequest.Create(url);
             req.UserAgent = UserAgent;
-            req.Timeout = 30000;
+            // Timeout covers only getting the response, not the transfer - that is
+            // ReadWriteTimeout. On the fresh PC that reported this, three attempts
+            // to fetch a 1 MB tool each burned about twenty seconds before failing,
+            // which is most of a minute and a half of doing nothing. Half the
+            // figure still leaves a slow connection room, and the big archive
+            // barely notices: it spends its time in the transfer, not the handshake.
+            req.Timeout = 15000;
             req.ReadWriteTimeout = 60000;
             req.AllowAutoRedirect = true;
             if (have > 0) req.AddRange(have);
@@ -1683,9 +1788,11 @@ namespace GoodPizza
             var exe = Find7z();
             if (exe == null)
             {
-                // The user already approved this in the download question.
+                // The download question names this tool when it is going to be
+                // needed (see Confirm): it is a second download the user did not ask
+                // for, it has no published checksum, and it is then run as admin.
                 var target = Path.Combine(Cfg.CacheDir, "7zr.exe");
-                Log.Warn("no 7-Zip found; downloading 7zr.exe (no published checksum to verify against)");
+                Log.Warn("no 7-Zip found; downloading 7zr.exe from 7-zip.org (no published checksum to verify against)");
                 if (!DownloadFile("https://www.7-zip.org/a/7zr.exe", target, -1, "", "7zr.exe")) return false;
                 exe = target;
             }
@@ -1800,6 +1907,121 @@ namespace GoodPizza
             catch { return false; }
         }
 
+        // --------------------------------------- 6. sideloading + WSA registration
+        // Windows refuses Add-AppxPackage -Register of an unpacked app (0x80073CFF)
+        // unless sideloading is allowed, which on a PC that has never been used for
+        // development it is not - exactly the machine this exe is aimed at. That is
+        // why the setting gets its own early step, before anything is downloaded.
+
+        // -1 = absent or unreadable. The value lives in the native hive, so the view
+        // is asked for explicitly rather than inherited from the process.
+        static int ReadHklmDword(string subKey, string name)
+        {
+            try
+            {
+                using (var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
+                using (var k = hklm.OpenSubKey(subKey))
+                {
+                    if (k == null) return -1;
+                    var v = k.GetValue(name);
+                    return v is int ? (int)v : -1;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("  registry read " + subKey + "\\" + name + ": " + ex.Message);
+                return -1;
+            }
+        }
+
+        // Settings writes two values for one switch: "Sideload apps" sets one and
+        // Developer Mode implies both. 1 = allowed, 0 = forbidden, -1 = never
+        // touched, which on Home and Pro means off.
+        static int ReadSideloadState(string subKey)
+        {
+            var side = ReadHklmDword(subKey, "AllowAllTrustedApps");
+            var dev = ReadHklmDword(subKey, "AllowDevelopmentWithoutDevLicense");
+            if (side == 1 || dev == 1) return 1;
+            if (side == 0 || dev == 0) return 0;
+            return -1;
+        }
+
+        static bool EnsureDeveloperMode()
+        {
+            const string appModel = @"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock";
+            const string policy = @"SOFTWARE\Policies\Microsoft\Windows\Appx";
+
+            // A policy of 0 wins over the setting, and this process cannot change it.
+            if (ReadSideloadState(policy) == 0)
+                return Fail("Developer Mode is switched off by a Windows policy (HKLM\\" + policy +
+                            "), and WSA cannot be registered while that is in force. Ask whoever " +
+                            "manages this PC, or allow it in the Local Group Policy Editor under " +
+                            "Computer Configuration > Administrative Templates > Windows Components > " +
+                            "App Package Deployment.");
+
+            if (ReadSideloadState(appModel) == 1)
+            {
+                Log.Info("Developer Mode is already on (sideloading allowed)");
+                return true;
+            }
+
+            Log.Warn("Developer Mode is off; Windows will not register WSA without it (0x80073CFF)");
+            if (Cfg.Yes) Log.Info("turning it on without asking (--yes)");
+            else
+            {
+                Log.Info("asking user to approve turning on Developer Mode");
+                Tray.SetStatus("waiting for your answer: turn on Developer Mode?");
+                using (var d = new AskPrompt(
+                    "Windows needs Developer Mode" + Environment.NewLine + "to install the game",
+                    "Windows will not install the game's Android subsystem" + Environment.NewLine +
+                    "without it. It is one setting, it stays on, and you" + Environment.NewLine +
+                    "can turn it off again later. Turn it on now?"))
+                {
+                    var r = d.ShowDialog();
+                    Log.Info("user answered: " + r);
+                    if (r != DialogResult.Yes)
+                    {
+                        // The same quiet path as declining the download: a
+                        // decision the user is entitled to, not a fault.
+                        Log.Warn("Developer Mode declined by the user; nothing was changed");
+                        throw new OperationCanceledException();
+                    }
+                }
+            }
+
+            try
+            {
+                // Both values: Settings writes one for "Sideload apps" and Developer
+                // Mode implies the other, and registering WSA wants the pair.
+                using (var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64))
+                using (var k = hklm.CreateSubKey(appModel))
+                {
+                    k.SetValue("AllowAllTrustedApps", 1, RegistryValueKind.DWord);
+                    k.SetValue("AllowDevelopmentWithoutDevLicense", 1, RegistryValueKind.DWord);
+                }
+            }
+            catch (Exception ex) { return Fail("could not turn on Developer Mode: " + ex.Message); }
+
+            if (ReadSideloadState(appModel) != 1)
+                return Fail("Developer Mode did not turn on. Turn it on in Settings > System > " +
+                            "For developers, then re-run.");
+            Log.Ok("Developer Mode turned on (HKLM\\" + appModel + ")");
+            return true;
+        }
+
+        // The start of an error is what explains it. Tail() kept the last 300
+        // characters, which is how the diagnosis on a French Windows got cut off
+        // mid-word - "prise sideloading configuration" - with the error code gone.
+        static string Head(string s)
+        {
+            foreach (var line in (s ?? "").Split('\n'))
+            {
+                var t = line.Trim();
+                if (t.Length > 0) return t.Length > 300 ? t.Substring(0, 300) : t;
+            }
+            return "(no output)";
+        }
+
         static bool EnsureRegistered()
         {
             var pkg = GetWsaPackage();
@@ -1815,7 +2037,21 @@ namespace GoodPizza
             string o;
             if (!RunPs("Add-AppxPackage -ForceApplicationShutdown -ForceUpdateFromAnyVersion -Register " + PsQuote(manifest),
                        "register", 10 * 60 * 1000, out o))
-                return Fail("registering WSA failed: " + Tail(o));
+            {
+                // The whole output goes to the log, and the window gets the
+                // diagnosis. Never match on the wording - Windows is localised, and
+                // the PC that reported this was running French - only on the code
+                // and the link Microsoft puts in the message.
+                Log.Warn("Add-AppxPackage said:" + Environment.NewLine + (o ?? "").Trim());
+                var code = Regex.Match(o ?? "", "0x[0-9A-Fa-f]{8}");
+                var sideload = (code.Success && code.Value.Equals("0x80073CFF", StringComparison.OrdinalIgnoreCase))
+                               || (o ?? "").IndexOf("LinkId=231020", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (sideload)
+                    return Fail("Windows refused to install WSA because sideloading / Developer Mode is not in effect (" +
+                                (code.Success ? code.Value : "0x80073CFF") + "). Turn on Settings > System > " +
+                                "For developers > Developer Mode, then re-run.");
+                return Fail("registering WSA failed" + (code.Success ? " (" + code.Value + ")" : "") + ": " + Head(o));
+            }
 
             pkg = GetWsaPackage();
             if (pkg == null) return Fail("WSA is still not registered after Add-AppxPackage");

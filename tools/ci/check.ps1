@@ -17,6 +17,9 @@
     dialogs    user-facing questions and failures go through AskPrompt /
                Attention; MessageBox stays allowed only for the one
                single-instance notice
+    tray       every literal Tray.SetStatus string still fits the 63-char
+               NotifyIcon.Text budget after the 25-char title prefix - two
+               statuses shipped once silently cut off in the tray
     icon       tools\goodpizza.ico exists with a valid ICO header (build input)
 
   Exit 0 = pass, 1 = fail. Every message starts with PASS or FAIL, so the run is
@@ -25,7 +28,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('hygiene', 'manifest', 'readme', 'dialogs', 'icon')]
+    [ValidateSet('hygiene', 'manifest', 'readme', 'dialogs', 'tray', 'icon')]
     [string]$Check
 )
 
@@ -133,6 +136,32 @@ switch ($Check) {
         if ($ask -eq 0) { Fail 'AskPrompt is no longer used - questions would fall back to MessageBox' }
         if ($att -eq 0) { Fail 'Attention() is no longer called - prompts could open behind other windows' }
         Pass ("dialogs: AskPrompt x{0}, Attention x{1}, MessageBox allowlisted x{2}" -f $ask, $att, $mb.Count)
+    }
+
+    'tray' {
+        $sp = Join-Path $root 'src\AppLauncher.cs'
+        if (-not (Test-Path -LiteralPath $sp)) { Fail 'src\AppLauncher.cs is missing' }
+        $src = Get-Content -LiteralPath $sp -Raw
+        # NotifyIcon.Text throws past 63 characters on the .NET Framework, and
+        # SetText() prefixes "Good Pizza, Great Pizza - " (25 chars), leaving 38
+        # for the status itself. Two statuses overran that budget once and were
+        # silently cut in the tray, so the literals are measured here. Only pure
+        # literals: the concatenated statuses end in a small variable part
+        # (MB counts, minutes) that is bounded by construction.
+        $bad = 0
+        $checked = 0
+        foreach ($m in [regex]::Matches($src, 'Tray\.SetStatus\("([^"]*)"\)')) {
+            $s = $m.Groups[1].Value
+            $checked++
+            if ((25 + $s.Length) -gt 63) {
+                Write-Output ("FAIL  tray status is {0} chars, {1} with the title prefix (limit 63): {2}" -f `
+                              $s.Length, (25 + $s.Length), $s)
+                $bad++
+            }
+        }
+        if ($checked -eq 0) { Fail 'no literal Tray.SetStatus call found - the status line changed shape and this check rotted' }
+        if ($bad -gt 0) { exit 1 }
+        Pass ("tray: {0} literal statuses fit the 63-char tray budget" -f $checked)
     }
 
     'icon' {

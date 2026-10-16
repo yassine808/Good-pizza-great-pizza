@@ -21,8 +21,8 @@ stays **completely silent** unless something goes wrong.
 Take `Good.Pizza.Great.Pizza.exe` from the
 [latest release](https://github.com/yassine808/Good-pizza-great-pizza/releases/latest),
 double-click it, and approve the UAC prompt. That is the whole install — it carries no
-installer, no runtime and no dependencies beyond stock Windows. The SHA-256 of each
-asset is printed on its release page.
+installer, no runtime and no dependencies beyond stock Windows. The SHA-256 of the
+current asset is printed on its release page.
 
 > **Antivirus.** The exe is not code-signed, and it downloads a subsystem, registers a
 > package and elevates itself — precisely the shape AV heuristics look for. Avast was
@@ -436,9 +436,9 @@ replacement is known to work.
 
 ## The Play Store half
 
-A virgin image ships with **developer mode OFF**, so port `58526` never opens and adb
-cannot be used to observe or poke anything. Every signal below was chosen because it
-works without adb.
+A virgin image ships with **Developer Mode off**, which is why adb cannot be taken for
+granted — the launcher turns the setting on itself (check 4) but treats `platform-tools`
+as optional. Every signal below works without adb, and nothing in this chain gates on it.
 
 Once the VM is up, the launcher:
 
@@ -448,19 +448,21 @@ Once the VM is up, the launcher:
 2. opens `market://details?id=com.tapblaze.pizzabusiness`, so Play records
    `installerPackageName=com.android.vending`. PairIP kills any install that did not
    come from Play, so the APK is **never** pushed.
-3. **re-fires** that `market://` every 45 s, for up to 20 minutes. This is not
+3. **re-fires** that `market://` every 45 s, for up to 30 minutes. This is not
    belt-and-braces: on an image that has never signed into Google the store process
    starts and then dies outright —
    `ActivityManager: Process com.android.vending (pid N) has died` — so no window ever
    enumerates until you complete sign-in. The launcher waits; it never enters credentials.
-4. detects the install from logcat evidence that the apk is resident on
-   `/data/app/...` (`/data/app/`, `Start proc`, `dexopt`, `Package [pkg]`). A bare
-   mention of the package name is *not* accepted — opening the store listing logs
-   `market://details?id=...` which contains it.
+4. detects the install with three signals: the exact `package:<id>` line from
+   `adb shell pm list packages` when the bridge is up, logcat evidence that the apk is
+   resident on `/data/app/...` (`/data/app/`, `Start proc`, `dexopt`, `Package [pkg]`),
+   and a marker file written the first time either one sees it, so a later run without
+   adb still knows. A bare mention of the package name is *not* accepted — opening the
+   store listing logs `market://details?id=...` which contains it.
 5. sets the ASTC texture split best-effort via adb if the bridge happens to be up —
    `debug.require_split=split_config.etc1_rgb8_group_hd.apk`, without which in-game
-   textures render black. Developer mode being off means this usually cannot run, so it
-   never blocks launch.
+   textures render black. The bridge and `platform-tools` are both optional, so this
+   often cannot run; it never blocks launch.
 6. launches the game through `wsa://`, waits for its window, and stays with it until it
    closes — then exits.
 
@@ -472,8 +474,9 @@ Once the VM is up, the launcher:
 > having **no** directory. Logcat tracks reality; `LocalState` does not.
 
 If you have not signed in yet, the Play Store cannot come up. The launcher keeps
-re-submitting the listing and waiting; the moment the account appears it continues on its
-own, all the way to launching the game. You never have to come back to it.
+re-submitting the listing and waiting; the moment you have signed in and installed, it
+continues on its own, all the way to launching the game. You never have to come back to
+it.
 
 ---
 
@@ -492,11 +495,12 @@ Good-pizza-great-pizza/
 │       ├── developer-mode-prompt.png  the first question, before any download
 │       ├── download-prompt.png        size, source and install path
 │       ├── download-progress.png      MB done, speed, time left
+│       ├── launching-bubble.png        the "Launching..." bubble
 │       ├── waiting-for-sign-in.png    the "action needed" notice
 │       ├── setup-problem.png          the failure window
 │       └── exe-icon-256.png           the icon the exe is built with
 ├── src/
-│   └── AppLauncher.cs                 the launcher (single file, C# 5, ~2,000 lines)
+│   └── AppLauncher.cs                 the launcher (single file, C# 5, ~3,100 lines)
 ├── payload/                           wsa.zip, split APKs  (gitignored — too big)
 └── tools/
     ├── build.ps1                      compiles src/ -> dist\Good Pizza, Great Pizza.exe
@@ -518,7 +522,8 @@ Good-pizza-great-pizza/
         ├── dep-install.ps1            dependency floor checks
         ├── setup-dump.ps1             WSA settings dump
         ├── uia-tree-dump.ps1          UIA tree of Android windows
-        └── dump-strings.ps1           WsaClient string sweep
+        ├── dump-strings.ps1           WsaClient string sweep
+        └── capture.ps1                window capture for docs/ (foreground-checked)
 ```
 
 `payload/` is gitignored on purpose: `wsa.zip` is ~1 GB and the split APKs are ~320 MB.
@@ -534,7 +539,7 @@ The launcher downloads WSA itself, so a copy of this repo does **not** need to c
 ## Building
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Version 1.1.5
 ```
 
 Output lands in `dist\Good Pizza, Great Pizza.exe` with the icon and the

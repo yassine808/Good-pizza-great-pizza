@@ -51,13 +51,33 @@ in service of getting Play Store up and running unattended.
 
 ---
 
-## Screenshot
+## Screenshots
 
 ![WSA first-run consent dialog — the gate that blocks every fresh install](docs/screenshots/first-run-consent.png)
 
 *The first-run consent dialog. WSA creates **no virtual machine** until this is answered.
 It is why a "fresh install" silently does nothing. See
 [The first-run gate](#the-first-run-gate).*
+
+Everything the launcher puts on screen, captured from one run on a clean machine
+(no WSA, Developer Mode off, no leftovers). All of it is either a question with a
+Yes/No answer, or a status/progress window — there is no configuration UI to learn.
+
+| File | What it shows |
+|---|---|
+| [`first-run-consent.png`](docs/screenshots/first-run-consent.png) | The WSA first-run consent dialog — the gate that must be answered before any VM is created |
+| [`developer-mode-prompt.png`](docs/screenshots/developer-mode-prompt.png) | The **first** question, asked before anything is downloaded: turn on Developer Mode? |
+| [`download-prompt.png`](docs/screenshots/download-prompt.png) | The download question: size (0.70 GB), source (with a clickable GitHub link) and install path |
+| [`download-progress.png`](docs/screenshots/download-progress.png) | The download window: MB done / total, a real speed and a time estimate |
+| [`launching-bubble.png`](docs/screenshots/launching-bubble.png) | The "Launching..." bubble: shown while an app is being opened, gone by itself once its window appears |
+| [`waiting-for-sign-in.png`](docs/screenshots/waiting-for-sign-in.png) | The "action needed" notice shown while it waits for **you** to sign in to Google |
+| [`setup-problem.png`](docs/screenshots/setup-problem.png) | The failure window: which check failed, the cause, a suggested fix and the log |
+| [`exe-icon-256.png`](docs/screenshots/exe-icon-256.png) | The icon embedded in the exe, taken from the Play Store asset |
+
+The prompts are deliberately few-words: one question, two buttons, and the reason in
+plain text. Screens are cropped to the window itself, and captures are only kept after
+the tool confirms the window actually owns the foreground — a screenshot taken a
+millisecond too early shows whatever window happened to be on top instead.
 
 ---
 
@@ -123,6 +143,13 @@ While it works, its only presence is a **tray icon** whose status line tracks th
 current step: `downloading WSA - 334 of 713 MB - 11.1 MB/s`, `waiting for Google
 sign-in - 3 min`, `playing - the launcher exits with the game`. Its menu offers the log
 and an **Exit launcher** that cancels the run exactly like Ctrl+C.
+
+**It says what it is doing.** Opening an app is not instant — on a first boot the
+Play Store can take minutes to appear — so while an app is being opened a small
+**"Launching..." bubble** sits in the top-right corner and names it
+(*Launching the Play Store...*, *Launching the game...*). It closes itself the
+moment that app's window shows up, and it never takes focus, so it cannot steal
+the keyboard from the app you are about to use.
 
 **It leaves when the game does.** After submitting the `wsa://` activation the launcher
 waits for the game window, then follows it and exits once it closes, so nothing of the
@@ -415,9 +442,17 @@ own, all the way to launching the game. You never have to come back to it.
 Good-pizza-great-pizza/
 ├── README.md
 ├── .gitignore                         dist/, payload/, _build/, *.log
+├── .github/
+│   └── workflows/
+│       └── ci.yml                     six checks: build, hygiene, manifest, readme, dialogs, icon
 ├── docs/
 │   └── screenshots/
 │       ├── first-run-consent.png      first-run gate, captured from the real dialog
+│       ├── developer-mode-prompt.png  the first question, before any download
+│       ├── download-prompt.png        size, source and install path
+│       ├── download-progress.png      MB done, speed, time left
+│       ├── waiting-for-sign-in.png    the "action needed" notice
+│       ├── setup-problem.png          the failure window
 │       └── exe-icon-256.png           the icon the exe is built with
 ├── src/
 │   └── AppLauncher.cs                 the launcher (single file, C# 5, ~2,000 lines)
@@ -428,6 +463,8 @@ Good-pizza-great-pizza/
     ├── app.manifest                   requireAdministrator + PerMonitorV2 DPI
     ├── make-icon.ps1                  7-size .ico from the Play Store asset
     ├── goodpizza.ico                  generated icon (build input, committed)
+    ├── ci/
+    │   └── check.ps1                  the five text checks (the build check is job 1 in ci.yml)
     ├── screenshot-dpi.ps1             DPI-aware capture used for docs/
     ├── uia-click-continue.ps1         drives the first-run consent dialog
     └── lab/                           the experiments behind every claim in this README
@@ -472,17 +509,29 @@ committed binary.
 
 ---
 
-## Screenshots
+## Continuous integration
 
-| File | What it shows |
+Every push runs six checks on GitHub Actions
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+
+| Check | Asserts |
 |---|---|
-| [`first-run-consent.png`](docs/screenshots/first-run-consent.png) | The WSA first-run consent dialog — the gate that must be answered before any VM is created |
-| [`exe-icon-256.png`](docs/screenshots/exe-icon-256.png) | The icon embedded in the exe, taken from the Play Store asset |
+| build | `tools\build.ps1` produces the exe, it is over 100 KB, and its assembly version is the one that was asked for |
+| hygiene | the shipped files (`src\`, `README.md`) carry no personal paths, temp dirs or unfinished-work markers |
+| manifest | the exe still requests `requireAdministrator` (registration fails `0x80073D28` without it) and declares `PerMonitorV2` |
+| readme | every relative link and image in this file resolves to a file that exists, so screenshots cannot rot |
+| dialogs | user-facing questions and failures go through `AskPrompt`/`Attention`; `MessageBox` only for the single-instance notice |
+| icon | `tools\goodpizza.ico` exists with a valid ICO header (the build needs no network to embed it) |
 
-Still to capture: the download prompt, the progress window and the failure log window.
-Their wording is verified through UI Automation element names, which is the reliable
-channel across the elevation boundary — screen capture is not, for the DPI reason
-described above.
+All six run `tools\ci\check.ps1`, the same script you can run locally:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\ci\check.ps1 -Check hygiene
+```
+
+Checks are scoped to what actually ships. `tools\lab\*` is the experiment log behind
+this README and legitimately contains local paths, so scanning it would only teach
+contributors to work around the gate.
 
 ---
 

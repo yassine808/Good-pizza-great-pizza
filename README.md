@@ -59,7 +59,7 @@ in service of getting Play Store up and running unattended.
 It is why a "fresh install" silently does nothing. See
 [The first-run gate](#the-first-run-gate).*
 
-Everything the launcher puts on screen, captured from one run on a clean machine
+Everything the launcher puts on screen, captured from runs on a clean machine
 (no WSA, Developer Mode off, no leftovers). All of it is either a question with a
 Yes/No answer, or a status/progress window — there is no configuration UI to learn.
 

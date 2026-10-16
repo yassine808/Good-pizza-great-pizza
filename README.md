@@ -140,8 +140,8 @@ when a check fails — and that window names *which* check failed and what to do
 it. On success you never see it at all.
 
 While it works, its only presence is a **tray icon** whose status line tracks the
-current step: `downloading WSA - 334 of 713 MB - 11.1 MB/s`, `waiting for Google
-sign-in - 3 min`, `playing - the launcher exits with the game`. Its menu offers the log
+current step: `downloading - 334/713 MB - 11.1 MB/s`, `waiting for
+sign-in - 3 min`, `playing - closes with the game`. Its menu offers the log
 and an **Exit launcher** that cancels the run exactly like Ctrl+C.
 
 **It says what it is doing.** Opening an app is not instant — on a first boot the

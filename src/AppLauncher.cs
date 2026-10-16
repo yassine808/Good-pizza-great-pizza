@@ -1024,6 +1024,7 @@ namespace GoodPizza
                             try { p.Kill(); } catch { }
                             Log.Warn("timeout on [" + tag + "] after " + timeoutMs + " ms");
                             lock (sb) output = sb.ToString();
+                            LogOutputTail(tag, output);
                             return false;
                         }
                     }
@@ -1041,7 +1042,11 @@ namespace GoodPizza
                         Thread.Sleep(50);
                     }
                     lock (sb) output = sb.ToString();
-                    if (p.ExitCode != 0) Log.Info("[" + tag + "] exit=" + p.ExitCode);
+                    if (p.ExitCode != 0)
+                    {
+                        Log.Info("[" + tag + "] exit=" + p.ExitCode);
+                        LogOutputTail(tag, output);
+                    }
                     return p.ExitCode == 0;
                 }
             }
@@ -1052,6 +1057,19 @@ namespace GoodPizza
                 output = ex.Message;
                 return false;
             }
+        }
+
+        // Child output used to reach the user ONLY through a failure cause string, so
+        // shortening those strings would have cost diagnosis. Failures now log their
+        // own tail: the failure window embeds the full log, the cause stays one plain
+        // sentence.
+        static void LogOutputTail(string tag, string output)
+        {
+            if (string.IsNullOrEmpty(output)) return;
+            var lines = output.TrimEnd().Split('\n');
+            var n = Math.Min(lines.Length, 15);
+            Log.Warn("[" + tag + "] output (last " + n + " of " + lines.Length + " lines):");
+            for (int i = lines.Length - n; i < lines.Length; i++) Log.Warn("  " + lines[i].TrimEnd('\r'));
         }
 
         static bool PortOpen(int port)
@@ -1081,7 +1099,7 @@ namespace GoodPizza
         static bool CheckAdmin()
         {
             Log.Info("process 64-bit: " + Environment.Is64BitProcess);
-            if (!IsElevated()) return Fail("not running as administrator (needed for WSA registration, services and C:\\WSA)");
+            if (!IsElevated()) return Fail("the launcher is not running as administrator");
             return true;
         }
 
@@ -1207,7 +1225,7 @@ namespace GoodPizza
                     if (!NeedSpace(new FileInfo(cached).Length)) return false;
                     archive = cached; return true;
                 }
-                return Fail("could not find a WSA download (" + discoverErr + "). Check your connection or set WsaUrl in launcher.config");
+                return Fail("could not find a download (" + discoverErr + "). Check your internet connection");
             }
 
             var target = Path.Combine(Cfg.CacheDir, a.Name);
@@ -1330,7 +1348,7 @@ namespace GoodPizza
                          : null;
 
             Log.Info("asking user to approve download of " + a.Name);
-            Tray.SetStatus("waiting for your answer: download WSA?");
+            Tray.SetStatus("question: download WSA?");
             using (var d = new DownloadPrompt(a, unpacker))
             {
                 var r = d.ShowDialog();
@@ -1827,7 +1845,8 @@ namespace GoodPizza
                         if (!got.Equals(expectedSha, StringComparison.OrdinalIgnoreCase))
                         {
                             File.Delete(part);
-                            return Fail("SHA-256 mismatch for " + label + " (got " + got + ", expected " + expectedSha + "); the file was discarded");
+                            Log.Err("SHA-256 got " + got + ", expected " + expectedSha);
+                            return Fail("the download was corrupted; it was discarded. Re-run to download it again");
                         }
                         Log.Ok("SHA-256 verified");
                     }
@@ -1948,7 +1967,9 @@ namespace GoodPizza
                         {
                             lastUi = sw.ElapsedMilliseconds;
                             ProgressWin.Set(done, total, rate);
-                            Tray.SetStatus("downloading WSA - " + MB(done) + " of " +
+                            // Tray budget is 38 chars (63 minus the title prefix);
+                            // the old wording over it and was silently cut off.
+                            Tray.SetStatus("downloading - " + MB(done) + "/" +
                                            (total > 0 ? MB(total) : "?") + " MB - " + N(rate) + " MB/s");
                         }
                         if (sw.ElapsedMilliseconds - lastLog >= 5000)         // log: readable, every 5s
@@ -1995,7 +2016,13 @@ namespace GoodPizza
                 if (!ok) return false;
 
                 var payload = FindManifestRoot(tmp);
-                if (payload == null) return Fail("archive extracted but contains no AppxManifest.xml - it is not a WSA build");
+                if (payload == null)
+                {
+                    // Wrong content can never succeed - and CacheValid would otherwise
+                    // keep it on disk and hand it back on the next offline run.
+                    try { File.Delete(archive); } catch { }
+                    return Fail("the downloaded files are not an Android build (no AppxManifest.xml); it was deleted - re-run to download again");
+                }
 
                 // A half-installed or foreign C:\WSA is moved aside, never deleted.
                 if (Directory.Exists(root))
@@ -2127,9 +2154,10 @@ namespace GoodPizza
                     msg.IndexOf("Unexpected end of", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     try { File.Delete(archive); } catch { }
-                    return Fail("the cached archive is damaged and was deleted: " + Tail(o) + " - re-run to download it again");
+                    return Fail("the cached archive is damaged; it was deleted - re-run to download it again");
                 }
-                return Fail("7-Zip extraction failed: " + Tail(o));
+                // The unpacker's tail is in the log now (LogOutputTail), not here.
+                return Fail("the files could not be unpacked (see the unpacker's message in the log)");
             }
             return true;
         }
@@ -2196,12 +2224,12 @@ namespace GoodPizza
 
                 var rx = new Regex(d.FileRegex, RegexOptions.IgnoreCase);
                 var appx = Directory.GetFiles(Cfg.WsaRoot, "*.appx").FirstOrDefault(f => rx.IsMatch(Path.GetFileName(f)));
-                if (appx == null) return Fail("the WSA payload has no .appx for " + d.Name);
+                if (appx == null) return Fail("the Android files are missing a required part (" + d.Name + ")");
 
                 Log.Info("  installing " + appx);
                 string o;
                 if (!RunPs("Add-AppxPackage -Path " + PsQuote(appx), "add " + d.Name, 10 * 60 * 1000, out o))
-                    return Fail("installing " + d.Name + " failed: " + Tail(o));
+                    return Fail("installing " + d.Name + " failed (see the unpacker/installer output in the log)");
 
                 var after = InstalledVersion(d.Name);
                 Log.Info("  now installed: " + (after ?? "none"));
@@ -2304,11 +2332,13 @@ namespace GoodPizza
 
             // A policy of 0 wins over the setting, and this process cannot change it.
             if (ReadSideloadState(policy) == 0)
-                return Fail("Developer Mode is switched off by a Windows policy (HKLM\\" + policy +
-                            "), and WSA cannot be registered while that is in force. Ask whoever " +
-                            "manages this PC, or allow it in the Local Group Policy Editor under " +
-                            "Computer Configuration > Administrative Templates > Windows Components > " +
-                            "App Package Deployment.");
+            {
+                // Registry path and editor path belong in the log, not in the window.
+                Log.Err("policy in force: HKLM\\" + policy + " = 0 - allowed in Local Group Policy " +
+                        "Editor > Computer Configuration > Administrative Templates > Windows Components > " +
+                        "App Package Deployment (this process cannot change it)");
+                return Fail("Developer Mode is switched off by this PC's administrator. Ask whoever manages this PC to allow it.");
+            }
 
             if (ReadSideloadState(appModel) == 1)
             {
@@ -2321,7 +2351,7 @@ namespace GoodPizza
             else
             {
                 Log.Info("asking user to approve turning on Developer Mode");
-                Tray.SetStatus("waiting for your answer: turn on Developer Mode?");
+                Tray.SetStatus("question: turn on Developer Mode?");
                 using (var d = new AskPrompt(
                     "Windows needs Developer Mode" + Environment.NewLine + "to install the game",
                     "Windows will not install the game's Android subsystem" + Environment.NewLine +
@@ -2360,19 +2390,6 @@ namespace GoodPizza
             return true;
         }
 
-        // The start of an error is what explains it. Tail() kept the last 300
-        // characters, which is how the diagnosis on a French Windows got cut off
-        // mid-word - "prise sideloading configuration" - with the error code gone.
-        static string Head(string s)
-        {
-            foreach (var line in (s ?? "").Split('\n'))
-            {
-                var t = line.Trim();
-                if (t.Length > 0) return t.Length > 300 ? t.Substring(0, 300) : t;
-            }
-            return "(no output)";
-        }
-
         static bool EnsureRegistered()
         {
             var pkg = GetWsaPackage();
@@ -2398,10 +2415,12 @@ namespace GoodPizza
                 var sideload = (code.Success && code.Value.Equals("0x80073CFF", StringComparison.OrdinalIgnoreCase))
                                || (o ?? "").IndexOf("LinkId=231020", StringComparison.OrdinalIgnoreCase) >= 0;
                 if (sideload)
-                    return Fail("Windows refused to install WSA because sideloading / Developer Mode is not in effect (" +
-                                (code.Success ? code.Value : "0x80073CFF") + "). Turn on Settings > System > " +
-                                "For developers > Developer Mode, then re-run.");
-                return Fail("registering WSA failed" + (code.Success ? " (" + code.Value + ")" : "") + ": " + Head(o));
+                    return Fail("Windows refused to install the Android files. Turn on Developer Mode " +
+                                "(Settings > System > For developers), then re-run");
+                // The full Add-AppxPackage output is already logged above (localised text
+                // and error code); the window only needs the headline.
+                return Fail("Windows would not register the Android files" +
+                            (code.Success ? " (" + code.Value + ")" : ""));
             }
 
             pkg = GetWsaPackage();
@@ -2433,7 +2452,7 @@ namespace GoodPizza
                 Log.Warn("New-VHD unavailable or failed (" + Tail(o) + "); trying diskpart");
                 made = DiskpartCreate(tpl);
             }
-            if (!made) return Fail("could not create " + tpl + " with New-VHD or diskpart");
+            if (!made) return Fail("could not create the Android disk file (New-VHD / diskpart failed)");
             Log.Info("created " + tpl + " (" + MB(new FileInfo(tpl).Length) + " MB on disk)");
             return true;
         }
@@ -2457,7 +2476,7 @@ namespace GoodPizza
             using (var sc = new ServiceController("WsaService"))
             {
                 try { var st = sc.Status; }
-                catch (InvalidOperationException) { return Fail("WsaService does not exist - WSA registration did not complete"); }
+                catch (InvalidOperationException) { return Fail("the Android service is missing - the install did not complete"); }
 
                 Log.Info("WsaService: " + sc.Status);
                 if (sc.Status == ServiceControllerStatus.Running) return true;
@@ -2466,11 +2485,11 @@ namespace GoodPizza
                     if (sc.Status == ServiceControllerStatus.Stopped) sc.Start();
                     sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(90));
                 }
-                catch (System.ServiceProcess.TimeoutException) { return Fail("WsaService did not reach Running within 90 s"); }
-                catch (InvalidOperationException ex) { return Fail("could not start WsaService: " + ex.Message); }
+                catch (System.ServiceProcess.TimeoutException) { return Fail("the Android service did not start within 90 s"); }
+                catch (InvalidOperationException ex) { return Fail("could not start the Android service: " + ex.Message); }
                 sc.Refresh();
                 Log.Info("WsaService: " + sc.Status);
-                return sc.Status == ServiceControllerStatus.Running || Fail("WsaService is " + sc.Status);
+                return sc.Status == ServiceControllerStatus.Running || Fail("the Android service is " + sc.Status);
             }
         }
 
@@ -2699,7 +2718,7 @@ namespace GoodPizza
 
             Log.Info("launching wsa://" + PlayStore + " (protocol activation is mandatory)");
             Status.Show("Launching the Play Store...");
-            if (!Open("wsa://" + PlayStore)) { Status.Close(); return Fail("protocol activation of wsa:// failed (WSA not registered?)"); }
+            if (!Open("wsa://" + PlayStore)) { Status.Close(); return Fail("Windows could not open the Android part; re-run the launcher"); }
 
             var sw = Stopwatch.StartNew();
             long lastClick = -10000, lastCrash = 0, lastLog = 0;
@@ -2719,8 +2738,8 @@ namespace GoodPizza
                         if (!noticed)
                         {
                             noticed = true;
-                            Notice.Show("Good Pizza launcher - action needed",
-                                "A Windows Subsystem for Android dialog is waiting.\r\nPlease click 'Continue'.");
+                            Notice.Show("Action needed",
+                                "The Android setup needs one click.\r\nPlease click 'Continue'.");
                         }
                     }
                     // Closed on Clicked AND on a clean "no dialog": the user may have
@@ -2744,7 +2763,12 @@ namespace GoodPizza
                 {
                     lastCrash = sw.ElapsedMilliseconds;
                     var crash = LastWsaCrash();
-                    if (crash != null) { Notice.Close(); Status.Close(); return Fail("WsaClient crashed: " + crash); }
+                    if (crash != null)
+                    {
+                        Log.Err("WsaClient crash record: " + crash);   // path + exception code, log only
+                        Notice.Close(); Status.Close();
+                        return Fail("the Android part crashed while starting");
+                    }
                 }
 
                 if (watcher.BootFinished) { Notice.Close(); Status.Close(); Log.Ok("Android boot complete after " + (sw.ElapsedMilliseconds / 1000) + "s (logcat)"); return true; }
@@ -2890,9 +2914,9 @@ namespace GoodPizza
 
             Log.Info("opening Play Store listing: market://details?id=" + GamePackage);
             Log.Info("Google sign-in is the user's step - we wait, we never enter credentials");
-            Notice.Show("Good Pizza launcher - action needed",
-                "Sign in to Google in the Play Store window, then tap Install.\r\n" +
-                "The launcher is waiting and will start the game when it is installed.");
+            Notice.Show("Action needed",
+                "Sign in to Google, then click Install.\r\n" +
+                "The launcher starts the game when it is ready.");
             Tray.SetStatus("waiting for Google sign-in + install");
             try
             {
@@ -2916,7 +2940,7 @@ namespace GoodPizza
                     {
                         if (!win) Status.Show("Launching the Play Store...");   // already visible: no bubble
                         if (!Open("market://details?id=" + GamePackage))
-                            return Fail("market:// activation failed; no protocol handler for the Play Store");
+                            return Fail("Windows could not open the Play Store; re-run the launcher");
                         fired++;
                         lastFire = sw.ElapsedMilliseconds;
                         if (fired > 1) Log.Info("  re-submitted store listing (attempt " + fired + ") - sign-in not finished yet?");
@@ -2976,7 +3000,7 @@ namespace GoodPizza
 
             Log.Info("launching wsa://" + GamePackage);
             Status.Show("Launching the game...");
-            if (!Open("wsa://" + GamePackage)) { Status.Close(); return Fail("launch failed: wsa:// activation error"); }
+            if (!Open("wsa://" + GamePackage)) { Status.Close(); return Fail("Windows could not start the game; re-run the launcher"); }
             Log.Info("launch submitted; waiting for the game window");
 
             var sw = Stopwatch.StartNew();
@@ -2998,7 +3022,7 @@ namespace GoodPizza
             // misses (~12s) rather than one, because a single UIA scan can miss
             // a window that is really there (a resize, a fullscreen toggle, a
             // momentary animation).
-            Tray.SetStatus("playing - the launcher exits with the game");
+            Tray.SetStatus("playing - closes with the game");
             var miss = 0;
             while (true)                            // Wait() throws if the user picks Exit
             {

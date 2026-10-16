@@ -264,6 +264,73 @@ namespace GoodPizza
         }
     }
 
+    // ------------------------------------------------- transient status bubble
+    // Between "we activated the app" and "its window is on screen" there is no UI
+    // at all - on a virgin first boot that stretch measured 16 minutes, so the
+    // launcher looked idle while it was actually waiting. This bubble says which
+    // app is being launched and closes itself the moment that app shows up
+    // (or the step ends), so the user always knows what is happening.
+    // Like Notice it never takes focus: it must not steal it from the app itself.
+    internal static class Status
+    {
+        static readonly object L = new object();
+        static Form _form;
+        static string _text;
+
+        sealed class BubbleForm : Form
+        {
+            protected override bool ShowWithoutActivation { get { return true; } }
+        }
+
+        public static void Show(string text)
+        {
+            lock (L) { if (_form != null && _text == text) return; }   // already up: no flicker
+            Close();
+            var ready = new ManualResetEvent(false);
+            var t = new Thread(() =>
+            {
+                try
+                {
+                    var f = new BubbleForm
+                    {
+                        Text = "Launching",
+                        FormBorderStyle = FormBorderStyle.FixedToolWindow,
+                        TopMost = true,
+                        ShowInTaskbar = false,
+                        StartPosition = FormStartPosition.Manual,
+                        Size = new System.Drawing.Size(420, 90)
+                    };
+                    var wa = Screen.PrimaryScreen.WorkingArea;
+                    f.Location = new System.Drawing.Point(wa.Right - f.Width - 12, wa.Top + 12);
+                    f.Controls.Add(new Label
+                    {
+                        Dock = DockStyle.Fill,
+                        Text = text,
+                        Padding = new Padding(10),
+                        Font = new System.Drawing.Font("Segoe UI", 10)
+                    });
+                    f.Shown += (s, e) => ready.Set();
+                    lock (L) { _form = f; _text = text; }
+                    Application.Run(f);
+                }
+                catch (Exception ex) { Log.Warn("status bubble: " + ex.Message); }
+                finally { ready.Set(); }
+            });
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
+            ready.WaitOne(3000);
+        }
+
+        public static void Close()
+        {
+            Form f;
+            lock (L) { f = _form; _form = null; _text = null; }
+            if (f == null) return;
+            try { f.BeginInvoke(new Action(() => f.Close())); } catch { }
+        }
+    }
+
     // ------------------------------------------------------------ tray icon
     // This exe opens no window, so during the long stretches where it is
     // legitimately doing nothing the user can see - a 700 MB download, and a
@@ -2124,9 +2191,86 @@ namespace GoodPizza
         }
 
         // ------------------------------------------------------- UIA helpers
+        // A UIA read blocks for as long as the target app refuses to pump messages:
+        // Current.Name on another process's window is a WM_GETTEXT sent to that
+        // process's thread. Measured on a virgin WSA first boot, one such read sat
+        // in the wait loop for 16 minutes (06:35:21 -> 06:51:57, resuming 98 ms
+        // after "Boot is finished"), so the user saw nothing while the clock ran.
+        // Nothing here can be cancelled, so such work runs on a helper thread with
+        // a budget: if it overruns, the caller keeps its last known state instead
+        // of freezing. One attempt per slot at a time - a stuck probe is never
+        // restarted, it just finishes in the background.
+        sealed class Bounded
+        {
+            readonly object _l = new object();
+            bool _busy;
+            int _slowAt = int.MinValue;
+
+            public bool Run(Action work, int timeoutMs, string tag)
+            {
+                Thread t = null;
+                lock (_l)
+                {
+                    if (!_busy)
+                    {
+                        _busy = true;
+                        t = new Thread(() =>
+                        {
+                            try { work(); }
+                            catch (Exception ex) { Log.Warn(tag + ": " + ex.Message); }
+                            finally { lock (_l) { _busy = false; } }
+                        });
+                        t.IsBackground = true;
+                        t.SetApartmentState(ApartmentState.STA);
+                        t.Start();
+                    }
+                }
+                bool ok;
+                if (t != null) ok = t.Join(timeoutMs);
+                else
+                {
+                    var sw = Stopwatch.StartNew();
+                    ok = false;
+                    while (sw.ElapsedMilliseconds < timeoutMs)
+                    {
+                        lock (_l) if (!_busy) { ok = true; break; }
+                        Thread.Sleep(50);
+                    }
+                }
+                if (ok) return true;
+                var now = Environment.TickCount;
+                lock (_l)
+                {
+                    if (_slowAt != int.MinValue && now - _slowAt < 30000) return false;
+                    _slowAt = now;
+                }
+                Log.Warn(tag + " did not answer within " + timeoutMs + " ms (an app window is not pumping messages) - not waiting");
+                return false;
+            }
+        }
+
+        static readonly Bounded _probe = new Bounded();
+        static readonly object _probeData = new object();
+        static List<string[]> _probeLast = new List<string[]>();
+
+        // Bounded probe: at most `timeoutMs` per call, result may be the last
+        // completed one (stale-but-safe: every caller treats "no window" as
+        // "keep waiting / try again later", never as a failure).
+        static List<string[]> WsaWindows(int timeoutMs)
+        {
+            _probe.Run(() =>
+            {
+                var r = WsaWindowsCore();
+                lock (_probeData) { _probeLast = r; }
+            }, timeoutMs, "window probe");
+            lock (_probeData) { return _probeLast; }
+        }
+
+        static List<string[]> WsaWindows() { return WsaWindows(5000); }
+
         // Top-level windows owned by WsaClient: [name, class]. Every property read is guarded
         // because UIA elements vanish between enumeration and read.
-        static List<string[]> WsaWindows()
+        static List<string[]> WsaWindowsCore()
         {
             var res = new List<string[]>();
             var procs = Process.GetProcessesByName("WsaClient");
@@ -2164,8 +2308,21 @@ namespace GoodPizza
 
         enum Click { NoDialog, Clicked, Failed }
 
+        static readonly Bounded _consent = new Bounded();
+
         // First-run consent dialog: class #32770, button "Continue". Nothing boots until answered.
+        // It reads the same non-pumping process as the window probe, so it carries the same
+        // freeze risk: bounded, one attempt at a time, and an overrun simply skips this tick -
+        // the dialog is retried every 10 s anyway.
         static Click TryClickContinue()
+        {
+            var res = Click.NoDialog;
+            if (_consent.Run(() => { res = TryClickContinueCore(); }, 5000, "consent dialog probe"))
+                return res;
+            return Click.NoDialog;
+        }
+
+        static Click TryClickContinueCore()
         {
             var procs = Process.GetProcessesByName("WsaClient");
             try
@@ -2233,7 +2390,8 @@ namespace GoodPizza
                      (File.Exists(ud) ? MB(new FileInfo(ud).Length) + " MB" : "absent (first boot)"));
 
             Log.Info("launching wsa://" + PlayStore + " (protocol activation is mandatory)");
-            if (!Open("wsa://" + PlayStore)) return Fail("protocol activation of wsa:// failed (WSA not registered?)");
+            Status.Show("Launching the Play Store...");
+            if (!Open("wsa://" + PlayStore)) { Status.Close(); return Fail("protocol activation of wsa:// failed (WSA not registered?)"); }
 
             var sw = Stopwatch.StartNew();
             long lastClick = -10000, lastCrash = 0, lastLog = 0;
@@ -2272,14 +2430,15 @@ namespace GoodPizza
                 {
                     lastCrash = sw.ElapsedMilliseconds;
                     var crash = LastWsaCrash();
-                    if (crash != null) { Notice.Close(); return Fail("WsaClient crashed: " + crash); }
+                    if (crash != null) { Notice.Close(); Status.Close(); return Fail("WsaClient crashed: " + crash); }
                 }
 
-                if (watcher.BootFinished) { Notice.Close(); Log.Ok("Android boot complete after " + (sw.ElapsedMilliseconds / 1000) + "s (logcat)"); return true; }
-                if (PortOpen(AdbPort)) { Notice.Close(); Log.Ok("adb bridge open after " + (sw.ElapsedMilliseconds / 1000) + "s"); return true; }
-                if (AndroidWindowPresent()) { Notice.Close(); Log.Ok("Android window visible after " + (sw.ElapsedMilliseconds / 1000) + "s"); return true; }
+                if (watcher.BootFinished) { Notice.Close(); Status.Close(); Log.Ok("Android boot complete after " + (sw.ElapsedMilliseconds / 1000) + "s (logcat)"); return true; }
+                if (PortOpen(AdbPort)) { Notice.Close(); Status.Close(); Log.Ok("adb bridge open after " + (sw.ElapsedMilliseconds / 1000) + "s"); return true; }
+                if (AndroidWindowPresent()) { Notice.Close(); Status.Close(); Log.Ok("Android window visible after " + (sw.ElapsedMilliseconds / 1000) + "s"); return true; }
             }
             Notice.Close();
+            Status.Close();
             return Fail("Android did not finish booting within " + Cfg.BootTimeoutMin + " minutes");
         }
 
@@ -2362,7 +2521,8 @@ namespace GoodPizza
             try
             {
                 var sw = Stopwatch.StartNew();
-                long lastFire = -StoreRefireMs, lastLog = 0;
+                long lastFire = -StoreRefireMs;
+                long lastMin = -1;                 // whole minutes already announced
                 int fired = 0;
                 bool sawWindow = false;
                 var timeoutMs = Cfg.InstallTimeoutMin * 60 * 1000;
@@ -2370,10 +2530,11 @@ namespace GoodPizza
                 while (sw.ElapsedMilliseconds < timeoutMs)
                 {
                     var win = AndroidWindowPresent();
-                    if (win && !sawWindow) { sawWindow = true; Log.Ok("Play Store surface visible after " + (sw.ElapsedMilliseconds / 1000) + "s"); }
+                    if (win && !sawWindow) { sawWindow = true; Log.Ok("Play Store surface visible after " + (sw.ElapsedMilliseconds / 1000) + "s"); Status.Close(); }
 
                     if (!win && sw.ElapsedMilliseconds - lastFire >= StoreRefireMs)
                     {
+                        Status.Show("Launching the Play Store...");
                         if (!Open("market://details?id=" + GamePackage))
                             return Fail("market:// activation failed; no protocol handler for the Play Store");
                         fired++;
@@ -2388,17 +2549,25 @@ namespace GoodPizza
                         Log.Ok("game installed after " + N(sw.Elapsed.TotalMinutes) + " minutes");
                         return true;
                     }
-                    if (sw.ElapsedMilliseconds - lastLog >= 60000)
+                    // One line per whole minute, numbered from the clock. The number is
+                    // derived from elapsed time and only logged when it changes, so the
+                    // sequence can never skip or repeat: the previous form
+                    // (elapsed - lastLog >= 60000, lastLog = elapsed) re-armed the timer
+                    // on a drifting loop, and once the check landed just past a minute
+                    // boundary - measured here at 19 min, then straight to 21 min - the
+                    // skipped minute was gone for good.
+                    var waitedMin = sw.ElapsedMilliseconds / 60000;
+                    if (waitedMin != lastMin)
                     {
-                        lastLog = sw.ElapsedMilliseconds;
-                        Log.Info("  still waiting for sign-in / install (" + (sw.ElapsedMilliseconds / 60000) + " min)");
-                        Tray.SetStatus("waiting for sign-in - " + (sw.ElapsedMilliseconds / 60000) + " min");
+                        lastMin = waitedMin;
+                        Log.Info("  still waiting for sign-in / install (" + waitedMin + " min)");
+                        Tray.SetStatus("waiting for sign-in - " + waitedMin + " min");
                     }
                 }
                 return Fail("the game was not installed within " + Cfg.InstallTimeoutMin +
                             " minutes (is a Google account signed in?)");
             }
-            finally { Notice.Close(); }
+            finally { Notice.Close(); Status.Close(); }
         }
 
         // ------------------------------------------------------- 11. launch
@@ -2415,7 +2584,8 @@ namespace GoodPizza
             else Log.Info("ASTC texture split skipped (adb bridge not available)");
 
             Log.Info("launching wsa://" + GamePackage);
-            if (!Open("wsa://" + GamePackage)) return Fail("launch failed: wsa:// activation error");
+            Status.Show("Launching the game...");
+            if (!Open("wsa://" + GamePackage)) { Status.Close(); return Fail("launch failed: wsa:// activation error"); }
             Log.Info("launch submitted; waiting for the game window");
 
             var sw = Stopwatch.StartNew();
@@ -2429,6 +2599,7 @@ namespace GoodPizza
             // The launch was submitted; a title mismatch must not strand a working install.
             else Log.Warn("could not confirm a window titled '*" + Cfg.GameWindowTitle + "*' within " +
                           (LaunchConfirmMs / 1000) + "s (set GameWindowTitle if the title differs)");
+            Status.Close();        // the bubble retires either way
             if (!seen) return true;     // nothing to follow
 
             // This launcher is a wrapper, not a resident program: it stays around

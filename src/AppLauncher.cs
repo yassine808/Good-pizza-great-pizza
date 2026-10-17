@@ -2664,6 +2664,16 @@ namespace GoodPizza
         // (The WSA Settings app is a different process, so it can no longer false-positive.)
         static bool AndroidWindowPresent() { return WsaWindows().Any(w => w[1] != "#32770"); }
 
+        // Step 11 cares about one app, not "some Android surface". The window class IS the
+        // Android package that owns it - measured with a UIA dump: "com.android.settings" for
+        // Settings, "com.android.vending(splash)" for the store's splash. Testing for any
+        // surface instead meant a leftover Settings window counted as the store being up, so
+        // the listing was never re-submitted and the user was left with no Play Store at all.
+        static bool StoreWindowPresent()
+        {
+            return WsaWindows().Any(w => w[1].StartsWith(PlayStore, StringComparison.OrdinalIgnoreCase));
+        }
+
         static bool GameWindowPresent()
         {
             return WsaWindows().Any(w => w[1] != "#32770" &&
@@ -3043,7 +3053,7 @@ namespace GoodPizza
                 // gigabyte to get this far.
                 while (!Cancelled)
                 {
-                    var win = AndroidWindowPresent();
+                    var win = StoreWindowPresent();
                     if (win && !sawWindow)
                     {
                         sawWindow = true;

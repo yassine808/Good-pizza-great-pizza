@@ -188,7 +188,7 @@ leaves with the game.
 | 8 | userdata template | `userdata.vhdx` exists in the package folder (blank 8 GB dynamic disk — Hyper-V module, diskpart fallback); without it first boot dies with `0xc0000409` |
 | 9 | WsaService | The Android service exists and reaches `Running` (started when stopped, 90 s budget) |
 | 10 | WSA boot | `wsa://` activation; clicks the first-run **Continue** every 10 s (shows the one-click notice when UIA cannot) while watching `userdata.2.vhdx`, `vmmemWSA` and WsaClient crash records; passes on logcat boot-finished, port 58526 or a visible Android window — 10 min timeout |
-| 11 | Play Store + game install | Opens the listing (`market://`), shows the sign-in notice, and polls for the game every 3 s until it is installed, with no timeout (adb package list, logcat, install marker on disk) - re-firing the listing only when no Android window ever comes up; afterwards confirms `installerPackageName` and warns when the copy did not come from Play |
+| 11 | Play Store + game install | Opens the listing (`market://`), shows the sign-in notice, and polls for the game every 3 s until it is installed, with no timeout (adb package list, logcat, install marker on disk) - re-firing the listing every 45 s for as long as no Play Store window is on screen; afterwards confirms `installerPackageName` and warns when the copy did not come from Play |
 | 12 | launch | Best-effort ASTC texture fix, `wsa://` with the "Launching..." bubble, confirms the game window within 90 s (a miss is a warning, never a failure), then follows the window and exits when the game closes |
 
 The first check that fails stops the run and opens the failure window with its
@@ -448,8 +448,10 @@ Once the VM is up, the launcher:
 2. opens `market://details?id=com.tapblaze.pizzabusiness`, so Play records
    `installerPackageName=com.android.vending`. PairIP kills any install that did not
    come from Play, so the APK is **never** pushed.
-3. **re-fires** that `market://` only when no Android window has come up at all - that is,
-   when the store failed to open, not when the user is slow. This is not
+3. **re-fires** that `market://` every 45 s for as long as no Play Store window is on
+   screen, then stops. The store is identified by its window class - `com.android.vending`,
+   `com.android.vending(splash)` - not by "any Android window", because an unrelated
+   surface left open from earlier would otherwise pass for a store that is up. This is not
    belt-and-braces: on an image that has never signed into Google the store process
    starts and then dies outright —
    `ActivityManager: Process com.android.vending (pid N) has died` — so no window ever
@@ -478,6 +480,17 @@ Once the VM is up, the launcher:
 > `com.tapblaze.pizzabusiness.ico/.png` were still present, `org.mozilla.firefox/` still
 > had its directory, and `com.google.android.gms` produced **14 755** logcat hits while
 > having **no** directory. Logcat tracks reality; `LocalState` does not.
+
+> **Why can't the launcher press "Install" itself?** Because UI Automation cannot see
+> inside the Android window. Measured while Android Settings sat fully loaded on screen
+> for 88 s: the window reports a subtree of **exactly one element - itself** - and no
+> children ever appear. What UIA does expose is the window class, which is the Android
+> package that owns it (`com.android.settings`, `com.android.vending(splash)`). WSA
+> renders Android into an opaque surface, so there is no button to find by name, and the
+> only alternative is blind clicks at guessed pixel coordinates in a storefront - which is
+> how you install the wrong app or fall into a sign-in flow. The sign-in and that single
+> Install tap are the user's; the marker above is what makes them a one-time cost rather
+> than something every payload reinstall undoes.
 
 If you have not signed in yet, the Play Store cannot come up. The launcher keeps
 re-submitting the listing and waiting; the moment you have signed in and installed, it

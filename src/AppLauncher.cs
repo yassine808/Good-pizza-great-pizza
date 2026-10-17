@@ -744,6 +744,7 @@ namespace GoodPizza
         const int AdbPort = 58526;
         const int PollMs = 2000;
         const int StoreRefireMs = 45 * 1000;    // the store process dies on an unsigned image
+        const int GameProbeMs = 45 * 1000;      // the game gets this long to prove itself; its launch is retried this often
         const int LaunchConfirmMs = 90 * 1000;
 
         internal const string PackageName = "MicrosoftCorporationII.WindowsSubsystemForAndroid_8wekyb3d8bbwe";
@@ -2669,16 +2670,21 @@ namespace GoodPizza
         // Settings, "com.android.vending(splash)" for the store's splash. Testing for any
         // surface instead meant a leftover Settings window counted as the store being up, so
         // the listing was never re-submitted and the user was left with no Play Store at all.
-        static bool StoreWindowPresent()
+        static bool IsStoreWindow(string[] w)
         {
-            return WsaWindows().Any(w => w[1].StartsWith(PlayStore, StringComparison.OrdinalIgnoreCase));
+            return w[1].StartsWith(PlayStore, StringComparison.OrdinalIgnoreCase);
         }
 
-        static bool GameWindowPresent()
+        // The same measurement names the game: its window class is its package id - the
+        // strongest identity available. The configurable title stays as the fallback.
+        static bool IsGameWindow(string[] w)
         {
-            return WsaWindows().Any(w => w[1] != "#32770" &&
-                w[0].IndexOf(Cfg.GameWindowTitle, StringComparison.OrdinalIgnoreCase) >= 0);
+            return w[1] != "#32770" &&
+                (w[1].StartsWith(GamePackage, StringComparison.OrdinalIgnoreCase) ||
+                 w[0].IndexOf(Cfg.GameWindowTitle, StringComparison.OrdinalIgnoreCase) >= 0);
         }
+
+        static bool GameWindowPresent() { return WsaWindows().Any(IsGameWindow); }
 
         enum Click { NoDialog, Clicked, Failed }
 
@@ -2777,9 +2783,15 @@ namespace GoodPizza
             Log.Info("VM already running: " + vmWasUp + "; userdata.2.vhdx: " +
                      (File.Exists(ud) ? MB(new FileInfo(ud).Length) + " MB" : "absent (first boot)"));
 
-            Log.Info("launching wsa://" + PlayStore + " (protocol activation is mandatory)");
-            Status.Show("Launching the Play Store...");
-            if (!Open("wsa://" + PlayStore)) { Status.Close(); return Fail("Windows could not open the Android part; re-run the launcher"); }
+            // Any wsa:// URI boots the subsystem; the package behind it is just the first app
+            // to open. When the install record vouches for this image, the game is the better
+            // boot target: the store never appears at all, and step 11's marker check is
+            // instant. Without a record the store boots as before - it is the one URI that is
+            // guaranteed to exist on a virgin image.
+            var bootTarget = MarkerMatches() ? GamePackage : PlayStore;
+            Log.Info("launching wsa://" + bootTarget + " (protocol activation is mandatory)");
+            Status.Show(bootTarget == GamePackage ? "Launching the game..." : "Launching the Play Store...");
+            if (!Open("wsa://" + bootTarget)) { Status.Close(); return Fail("Windows could not open the Android part; re-run the launcher"); }
 
             var sw = Stopwatch.StartNew();
             long lastClick = -10000, lastCrash = 0, lastLog = 0;
@@ -3027,9 +3039,58 @@ namespace GoodPizza
                 Log.Warn("installer: " + inst + " - NOT the Play Store; this copy was installed outside the store");
         }
 
+        // The last observation available when nothing else survives: adb is absent, the
+        // logcat floor excludes earlier sessions, and no marker was ever written - a game
+        // installed by hand, or before this build existed. Submitting the game's own launch
+        // costs nothing when it is missing (Android answers "Failed to find intent" and no
+        // window appears) and the window is proof when it is there - written straight into
+        // the marker so later runs skip all of this.
+        static bool TryProbeGame()
+        {
+            Log.Info("install status unknown; trying the game before opening the store");
+            Tray.SetStatus("checking for the game...");
+            Status.Show("Looking for the game...");
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                // A refused activation means the shell could not reach WsaClient at all;
+                // fall through to the store, whose own activation reports that properly.
+                if (!Open("wsa://" + GamePackage))
+                {
+                    Log.Info("  the launch request was refused; treating the game as not installed");
+                    return false;
+                }
+
+                while (sw.ElapsedMilliseconds < GameProbeMs && !Cancelled)
+                {
+                    if (WsaWindows().Any(IsGameWindow))
+                    {
+                        Log.Ok("the game is on this image - launched it directly after " +
+                               (sw.ElapsedMilliseconds / 1000) + "s");
+                        RememberInstalled();
+                        return true;
+                    }
+                    var w = Watcher();
+                    w.Poll();
+                    if (w.SawRemoval) TryDeleteInstallMarker();
+                    if (w.GameInstalled)
+                    {
+                        Log.Ok("the game process started - treating it as installed");
+                        RememberInstalled();
+                        return true;
+                    }
+                    Wait(2000);
+                }
+                Log.Info("no window after " + (GameProbeMs / 1000) + "s; treating the game as not installed");
+                return false;
+            }
+            finally { Status.Close(); }
+        }
+
         static bool EnsureStoreAndGame()
         {
             if (GameInstalled()) { Log.Ok("game already installed"); CheckInstaller(); return true; }
+            if (TryProbeGame()) { CheckInstaller(); return true; }
 
             Log.Info("the game is not installed; opening its Play Store listing: market://details?id=" + GamePackage);
             Log.Info("Google sign-in is the user's step - we wait, we never enter credentials");
@@ -3045,15 +3106,36 @@ namespace GoodPizza
             {
                 var sw = Stopwatch.StartNew();
                 bool sawWindow = false;
-                long lastFire = -StoreRefireMs;
+                long lastFire = 0;
+                long lastProbe = 0;
                 long lastLog = -60000;
+
+                // Fire once up front, before any waiting: a store window already on screen
+                // came from the boot step and usually shows wherever it left off - its home -
+                // and the old "a window is up, so don't re-fire" rule left the user to find
+                // the game themselves. A re-fire under the user's fingers is still avoided:
+                // the loop below only repeats this when the store never came up.
+                if (!Open("market://details?id=" + GamePackage))
+                    return Fail("Windows could not open the Play Store; re-run the launcher");
 
                 // No deadline. A timeout here only ever abandoned a user part-way through a
                 // Google sign-in, and the run had already downloaded three quarters of a
                 // gigabyte to get this far.
                 while (!Cancelled)
                 {
-                    var win = StoreWindowPresent();
+                    // One window enumeration answers both questions this tick asks.
+                    var wins = WsaWindows();
+                    if (wins.Any(IsGameWindow))
+                    {
+                        // The promised ending: the user tapped Install and walked away, a
+                        // periodic launch attempt found the package, and the game came up by
+                        // itself - no second interaction needed.
+                        Log.Ok("the game is on screen after " + N(sw.Elapsed.TotalMinutes) + " minutes");
+                        RememberInstalled();
+                        CheckInstaller();
+                        return true;
+                    }
+                    var win = wins.Any(IsStoreWindow);
                     if (win && !sawWindow)
                     {
                         sawWindow = true;
@@ -3075,6 +3157,16 @@ namespace GoodPizza
                         if (!Open("market://details?id=" + GamePackage))
                             return Fail("Windows could not open the Play Store; re-run the launcher");
                         lastFire = sw.ElapsedMilliseconds;
+                    }
+
+                    // Re-try the game's launch too: the install can finish while the user
+                    // watches the store page. Until the package exists this is a silent no-op
+                    // on the Android side; the moment it does, the game opens by itself,
+                    // exactly as the one-time notice promised.
+                    if (sw.ElapsedMilliseconds - lastProbe >= GameProbeMs)
+                    {
+                        lastProbe = sw.ElapsedMilliseconds;
+                        Open("wsa://" + GamePackage);
                     }
 
                     Wait(3000);

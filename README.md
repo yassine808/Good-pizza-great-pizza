@@ -132,10 +132,11 @@ flowchart TD
     L -- yes --> M[Wait for boot<br/>vmmemWSA + port 58526]
     M --> N{Play Store<br/>reachable?}
     N -- no --> E
-    N -- yes --> O[Open Play page<br/>installerPackageName]
-    O --> K{Game installed?}
-    K -- no --> W[Play Store opens<br/>USER signs in + installs]
-    W --> X{installed yet?<br/>poll 3 s<br/>no timeout}
+    N -- yes --> K{Game on this image?<br/>adb / logcat / marker}
+    K -- no --> P[Try the game once<br/>window = it was there]
+    P -- window --> Y
+    P -- nothing --> W[Play Store opens<br/>USER signs in + installs]
+    W --> X{installed yet?<br/>poll 3 s, launch tries<br/>no timeout}
     X -- no --> X
     X -- yes --> K
     K -- yes --> Y[Apply ASTC texture fix]
@@ -190,8 +191,8 @@ leaves with the game.
 | 7 | WSA registration | Registers the package from `C:\WSA` to status `Ok`; a sideload refusal (`0x80073CFF`) is translated into "turn on Developer Mode" |
 | 8 | userdata template | `userdata.vhdx` exists in the package folder (blank 8 GB dynamic disk — Hyper-V module, diskpart fallback); without it first boot dies with `0xc0000409` |
 | 9 | WsaService | The Android service exists and reaches `Running` (started when stopped, 90 s budget) |
-| 10 | WSA boot | `wsa://` activation; clicks the first-run **Continue** every 10 s (shows the one-click notice when UIA cannot) while watching `userdata.2.vhdx`, `vmmemWSA` and WsaClient crash records; passes on logcat boot-finished, port 58526 or a visible Android window — 10 min timeout |
-| 11 | Play Store + game install | Opens the listing (`market://`), shows the sign-in notice, and polls for the game every 3 s until it is installed, with no timeout (adb package list, logcat, install marker on disk) - re-firing the listing every 45 s for as long as no Play Store window is on screen; afterwards confirms `installerPackageName` and warns when the copy did not come from Play |
+| 10 | WSA boot | `wsa://` activation — the **game's** when the install record matches this image, the Play Store otherwise, since the boot URI decides what appears first; clicks the first-run **Continue** every 10 s (shows the one-click notice when UIA cannot) while watching `userdata.2.vhdx`, `vmmemWSA` and WsaClient crash records; passes on logcat boot-finished, port 58526 or a visible Android window — 10 min timeout |
+| 11 | Play Store + game install | With no proof of an install anywhere (no adb, nothing in this session's logcat, no marker) the game's own launch is tried first — a window means it was there all along and the store never opens. Otherwise: fires the listing (`market://`) once up front, shows the sign-in notice, and polls every 3 s until the game is there, with no timeout (adb package list, logcat, install marker on disk, the game window) - re-firing the listing every 45 s while no Play Store window is on screen, and re-trying the game's launch every 45 s so a finished install opens the game by itself; afterwards confirms `installerPackageName` and warns when the copy did not come from Play |
 | 12 | launch | Best-effort ASTC texture fix, `wsa://` with the "Launching..." bubble, confirms the game window within 90 s (a miss is a warning, never a failure), then follows the window and exits when the game closes |
 
 The first check that fails stops the run and opens the failure window with its
@@ -447,8 +448,12 @@ Once the VM is up, the launcher:
 
 1. confirms boot by reading WSA's own logcat under
    `LocalState\diagnostics\logcat\` for `"Boot is finished"` — and/or an Android window
-   enumerating through UI Automation. It does **not** gate on adb.
-2. opens `market://details?id=com.tapblaze.pizzabusiness`, so Play records
+   enumerating through UI Automation. It does **not** gate on adb. The boot URI itself
+   goes to the **game** when the install marker matches this image, so the store never
+   appears at all, and to the Play Store otherwise — any `wsa://` URI boots the
+   subsystem; the package behind it is just the first app to open.
+2. fires `market://details?id=com.tapblaze.pizzabusiness` once up front — a store window
+   already on screen came from the boot step and usually shows its home — so Play records
    `installerPackageName=com.android.vending`. PairIP kills any install that did not
    come from Play, so the APK is **never** pushed.
 3. **re-fires** that `market://` every 45 s for as long as no Play Store window is on
@@ -459,17 +464,23 @@ Once the VM is up, the launcher:
    starts and then dies outright —
    `ActivityManager: Process com.android.vending (pid N) has died` — so no window ever
    enumerates until you complete sign-in. The launcher waits; it never enters credentials.
-4. detects the install with three signals: the exact `package:<id>` line from
+4. detects the install with four signals: the exact `package:<id>` line from
    `adb shell pm list packages` when the bridge is up, logcat evidence that the apk is
    resident on `/data/app/...` (`/data/app/`, `Start proc`, `dexopt`, `Package [pkg]`),
-   and a marker file written the first time either one sees it, so a later run without
-   adb still knows. A bare mention of the package name is *not* accepted — opening the
-   store listing logs `market://details?id=...` which contains it. The marker is kept in
-   `%LOCALAPPDATA%\GoodPizza\game-installed.txt`, not inside `C:\WSA`, and is keyed to the
-   creation time of WSA's own `userdata.2.vhdx` - the disk that actually holds the game.
-   Keeping it in `C:\WSA` forgot a genuinely installed game on every payload reinstall,
-   because the launcher replaces that directory while the game survives untouched in WSA's
-   app data; a rebuilt Android image now correctly invalidates the record instead.
+   a marker file written the first time either one sees it, so a later run without
+   adb still knows — and, when none of those can answer (adb absent, the logcat floor
+   excludes earlier sessions, installed by hand or before this build existed), the
+   **game's own launch attempt**: fire `wsa://<id>` and watch for its window, which is
+   proof and writes the marker for every later run. On a package that is missing this
+   costs nothing — Android answers `IntentRedirectionHandler: Failed to find intent for
+   package launch` and no window is ever created. A bare mention of the package name is
+   *not* accepted — opening the store listing logs `market://details?id=...` which
+   contains it. The marker is kept in `%LOCALAPPDATA%\GoodPizza\game-installed.txt`, not
+   inside `C:\WSA`, and is keyed to the creation time of WSA's own `userdata.2.vhdx` -
+   the disk that actually holds the game. Keeping it in `C:\WSA` forgot a genuinely
+   installed game on every payload reinstall, because the launcher replaces that
+   directory while the game survives untouched in WSA's app data; a rebuilt Android image
+   now correctly invalidates the record instead.
 5. sets the ASTC texture split best-effort via adb if the bridge happens to be up —
    `debug.require_split=split_config.etc1_rgb8_group_hd.apk`, without which in-game
    textures render black. The bridge and `platform-tools` are both optional, so this
@@ -496,9 +507,10 @@ Once the VM is up, the launcher:
 > than something every payload reinstall undoes.
 
 If you have not signed in yet, the Play Store cannot come up. The launcher keeps
-re-submitting the listing and waiting; the moment you have signed in and installed, it
-continues on its own, all the way to launching the game. You never have to come back to
-it.
+re-submitting the listing and waiting; the moment you have signed in and installed, its
+periodic `wsa://<game>` attempt opens the game by itself — no second interaction — and
+the window writes the marker, so every run after that boots straight into the game
+without the store ever appearing. You never have to come back to it.
 
 ---
 
@@ -561,7 +573,7 @@ The launcher downloads WSA itself, so a copy of this repo does **not** need to c
 ## Building
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Version 1.1.6
+powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Version 1.1.7
 ```
 
 Output lands in `dist\Good Pizza, Great Pizza.exe` with the icon and the

@@ -132,7 +132,7 @@ flowchart TD
     N -- yes --> O[Open Play page<br/>installerPackageName]
     O --> K{Game installed?}
     K -- no --> W[Play Store opens<br/>USER signs in + installs]
-    W --> X{installed yet?<br/>poll 3 s / re-fire 45 s<br/>max 30 min}
+    W --> X{installed yet?<br/>poll 3 s<br/>no timeout}
     X -- no --> X
     X -- yes --> K
     K -- yes --> Y[Apply ASTC texture fix]
@@ -188,7 +188,7 @@ leaves with the game.
 | 8 | userdata template | `userdata.vhdx` exists in the package folder (blank 8 GB dynamic disk — Hyper-V module, diskpart fallback); without it first boot dies with `0xc0000409` |
 | 9 | WsaService | The Android service exists and reaches `Running` (started when stopped, 90 s budget) |
 | 10 | WSA boot | `wsa://` activation; clicks the first-run **Continue** every 10 s (shows the one-click notice when UIA cannot) while watching `userdata.2.vhdx`, `vmmemWSA` and WsaClient crash records; passes on logcat boot-finished, port 58526 or a visible Android window — 10 min timeout |
-| 11 | Play Store + game install | Opens the listing (`market://`), shows the sign-in notice, and polls for the game every 3 s for up to 30 min (adb package list, logcat, install marker on disk) — re-firing the listing every 45 s while no Android window is on screen; afterwards confirms `installerPackageName` and warns when the copy did not come from Play |
+| 11 | Play Store + game install | Opens the listing (`market://`), shows the sign-in notice, and polls for the game every 3 s until it is installed, with no timeout (adb package list, logcat, install marker on disk) - re-firing the listing only when no Android window ever comes up; afterwards confirms `installerPackageName` and warns when the copy did not come from Play |
 | 12 | launch | Best-effort ASTC texture fix, `wsa://` with the "Launching..." bubble, confirms the game window within 90 s (a miss is a warning, never a failure), then follows the window and exits when the game closes |
 
 The first check that fails stops the run and opens the failure window with its
@@ -448,7 +448,8 @@ Once the VM is up, the launcher:
 2. opens `market://details?id=com.tapblaze.pizzabusiness`, so Play records
    `installerPackageName=com.android.vending`. PairIP kills any install that did not
    come from Play, so the APK is **never** pushed.
-3. **re-fires** that `market://` every 45 s, for up to 30 minutes. This is not
+3. **re-fires** that `market://` only when no Android window has come up at all - that is,
+   when the store failed to open, not when the user is slow. This is not
    belt-and-braces: on an image that has never signed into Google the store process
    starts and then dies outright —
    `ActivityManager: Process com.android.vending (pid N) has died` — so no window ever
@@ -458,7 +459,12 @@ Once the VM is up, the launcher:
    resident on `/data/app/...` (`/data/app/`, `Start proc`, `dexopt`, `Package [pkg]`),
    and a marker file written the first time either one sees it, so a later run without
    adb still knows. A bare mention of the package name is *not* accepted — opening the
-   store listing logs `market://details?id=...` which contains it.
+   store listing logs `market://details?id=...` which contains it. The marker is kept in
+   `%LOCALAPPDATA%\GoodPizza\game-installed.txt`, not inside `C:\WSA`, and is keyed to the
+   creation time of WSA's own `userdata.2.vhdx` - the disk that actually holds the game.
+   Keeping it in `C:\WSA` forgot a genuinely installed game on every payload reinstall,
+   because the launcher replaces that directory while the game survives untouched in WSA's
+   app data; a rebuilt Android image now correctly invalidates the record instead.
 5. sets the ASTC texture split best-effort via adb if the bridge happens to be up —
    `debug.require_split=split_config.etc1_rgb8_group_hd.apk`, without which in-game
    textures render black. The bridge and `platform-tools` are both optional, so this

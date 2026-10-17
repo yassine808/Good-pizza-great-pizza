@@ -49,7 +49,7 @@ namespace GoodPizza
     // Precedence (later wins): defaults < launcher.config < environment < CLI.
     // launcher.config is "key=value" lines beside the exe; '#' starts a comment.
     // Keys: WsaRoot, WsaUrl, Repo, AssetRequire, AssetExclude, Sha256,
-    //       BootTimeoutMin, InstallTimeoutMin, Yes, DownloadAdb, GameWindowTitle
+    //       BootTimeoutMin, Yes, DownloadAdb, GameWindowTitle
     // Env : GP_WSA_ROOT, GP_WSA_URL, GP_WSA_REPO, GP_WSA_SHA256, GITHUB_TOKEN (API rate limit)
     // CLI : --WsaUrl=... --Repo=owner/name --yes (skip the download question)
     internal static class Cfg
@@ -61,7 +61,6 @@ namespace GoodPizza
         public static string AssetExclude = "arm64|Windows_10|NoGApps|WithoutGApps|Without-GApps";
         public static string Sha256 = "";                       // expected hash for WsaUrl downloads
         public static int BootTimeoutMin = 10;
-        public static int InstallTimeoutMin = 30;
         public static bool Yes = false;                         // assume "yes" to the download question
         public static bool DownloadAdb = false;                 // optional platform-tools download
         public static string GameWindowTitle = "Pizza";
@@ -119,7 +118,6 @@ namespace GoodPizza
                 case "assetexclude": AssetExclude = v; break;
                 case "sha256": Sha256 = v; break;
                 case "boottimeoutmin": if (int.TryParse(v, out n) && n > 0) BootTimeoutMin = n; break;
-                case "installtimeoutmin": if (int.TryParse(v, out n) && n > 0) InstallTimeoutMin = n; break;
                 case "yes": Yes = !v.Equals("false", StringComparison.OrdinalIgnoreCase); break;
                 case "downloadadb": DownloadAdb = !v.Equals("false", StringComparison.OrdinalIgnoreCase); break;
                 case "gamewindowtitle": GameWindowTitle = v; break;
@@ -1159,12 +1157,18 @@ namespace GoodPizza
             var manifest = Path.Combine(Cfg.WsaRoot, "AppxManifest.xml");
             if (!File.Exists(manifest)) return false;
             if (File.Exists(MarkerPath)) return true;                 // our own completed install
-            if (File.Exists(Path.Combine(Cfg.WsaRoot, "WsaClient.exe")))
+            // The build ships WsaClient.exe inside its own subdirectory, never at the root -
+            // checked against the archive this launcher itself downloads
+            // (WSA_2407.40000.4.0_x64\WsaClient\WsaClient.exe). Testing the root alone made
+            // the acceptance branch unreachable, so any complete install without our marker
+            // was declared broken and sent off to re-download 713 MB.
+            if (File.Exists(Path.Combine(Cfg.WsaRoot, "WsaClient", "WsaClient.exe")) ||
+                File.Exists(Path.Combine(Cfg.WsaRoot, "WsaClient.exe")))
             {
                 Log.Warn("no completion marker, but manifest + WsaClient.exe exist; accepting a manual install");
                 return true;
             }
-            Log.Warn("AppxManifest.xml present but WsaClient.exe missing - install looks incomplete");
+            Log.Warn("AppxManifest.xml present but no WsaClient.exe - install looks incomplete");
             return false;
         }
 
@@ -2031,6 +2035,7 @@ namespace GoodPizza
                     {
                         var aside = root + ".old-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
                         Log.Warn("existing " + root + " is not a complete install; moving it to " + aside);
+                        StopWsa();                        // its handles are what block this move
                         Directory.Move(root, aside);
                     }
                     else Directory.Delete(root);
@@ -2060,6 +2065,52 @@ namespace GoodPizza
                 return Fail("disk full while extracting: " + ex.Message);
             }
             finally { CleanupTemp(); _tmpDir = null; }
+        }
+
+        // C:\WSA owns the running subsystem: WsaClient.exe lives inside it and the VM keeps
+        // handles on the payload, so moving the directory aside throws "file is being used by
+        // another process" and the run died with a perfectly good install still in place.
+        // Stopped here rather than at every earlier step: the earlier checks only read.
+        // Best effort throughout - a subsystem that will not stop is reported, not fatal,
+        // because the move itself is the real test.
+        static void StopWsa()
+        {
+            if (CountProcs("vmmemWSA") == 0 && CountProcs("WsaClient") == 0)
+            { Log.Info("WSA is not running"); return; }
+
+            Log.Info("stopping WSA so its files can be replaced ...");
+            string o;
+            RunPs("(Get-AppxPackage -Name 'MicrosoftCorporationII.WindowsSubsystemForAndroid').PackageFullName | " +
+                  "ForEach-Object { Stop-AppxPackage -Package $_ -ErrorAction SilentlyContinue }",
+                  "Stop-AppxPackage", 60000, out o);
+            try
+            {
+                using (var sc = new ServiceController("WsaService"))
+                {
+                    if (sc.Status == ServiceControllerStatus.Running)
+                    {
+                        sc.Stop();
+                        sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    }
+                    Log.Info("WsaService: " + sc.Status);
+                }
+            }
+            catch (Exception ex) { Log.Warn("  WsaService stop: " + ex.Message); }
+
+            foreach (var n in new[] { "WsaClient", "WSACrashUploader", "WsaSettings", "WsaProxy", "WsaSettingsBroker" })
+                foreach (var p in Process.GetProcessesByName(n))
+                {
+                    try { if (!p.HasExited) p.Kill(); }
+                    catch (Exception ex) { Log.Warn("  " + n + " stop: " + ex.Message); }
+                    finally { p.Dispose(); }
+                }
+
+            // The handles on C:\WSA are held by the VM, not by WsaClient - wait for it to go.
+            for (var i = 0; i < 40 && (CountProcs("vmmemWSA") > 0 || CountProcs("WsaClient") > 0); i++)
+                Thread.Sleep(500);
+            if (CountProcs("vmmemWSA") > 0 || CountProcs("WsaClient") > 0)
+                Log.Warn("  the subsystem is still running; replacing C:\\WSA may still fail");
+            else Log.Ok("  WSA stopped");
         }
 
         static string FindManifestRoot(string dir)
@@ -2848,9 +2899,61 @@ namespace GoodPizza
         // ----------------------------------------- 10. Play Store + game install
         // On an image that was never signed into Google the store process starts and then
         // dies ("Process com.android.vending has died"), so this is a wait-on-user step.
-        // One shared timeout and one strategy: re-submit market:// only while no Android
-        // window is visible; once the store is on screen, leave the user alone.
-        static string InstallMarker { get { return Path.Combine(Cfg.WsaRoot, ".gp-game"); } }
+        // One strategy: re-submit market:// only while no Android window is visible; once the
+        // store is on screen, leave the user alone. No timeout - waiting is this step's job,
+        // and an earlier 30 minute cap only ever abandoned a user mid-sign-in; the tray's
+        // Exit is the way out.
+        // Where the game actually lives is WSA's own app data
+        // (%LOCALAPPDATA%\Packages\<wsa>\LocalCache\userdata.2.vhdx), not C:\WSA - which this
+        // launcher replaces whenever it re-extracts the payload. Recording the install inside
+        // C:\WSA therefore forgot a genuinely installed game across any payload reinstall, and
+        // the next run sat in the Play Store for thirty minutes instead of launching. The
+        // record now lives in our own directory and is keyed to the disk that holds the game,
+        // so a recreated Android image correctly invalidates it.
+        static string UserDataVhdx
+        {
+            get
+            {
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Packages", Program.PackageName, "LocalCache", "userdata.2.vhdx");
+            }
+        }
+
+        static string InstallMarker
+        {
+            get
+            {
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "GoodPizza", "game-installed.txt");
+            }
+        }
+
+        // Creation time survives reboots and writes, and changes only when WSA builds the disk
+        // from scratch - which is exactly the event that uninstalls every Android app.
+        static string UserDataStamp()
+        {
+            try
+            {
+                var f = new FileInfo(UserDataVhdx);
+                return f.Exists ? f.CreationTimeUtc.ToString("o", CultureInfo.InvariantCulture) : null;
+            }
+            catch { return null; }
+        }
+
+        static bool MarkerMatches()
+        {
+            try
+            {
+                if (!File.Exists(InstallMarker)) return false;
+                var want = UserDataStamp();
+                if (want == null) return false;           // the Android disk is gone: so is the game
+                foreach (var line in File.ReadAllLines(InstallMarker))
+                    if (line.StartsWith("userdata=", StringComparison.OrdinalIgnoreCase))
+                        return line.Substring("userdata=".Length).Trim() == want;
+                return false;
+            }
+            catch { return false; }
+        }
 
         static bool GameInstalled()
         {
@@ -2867,10 +2970,10 @@ namespace GoodPizza
             if (w.SawRemoval) TryDeleteInstallMarker();     // uninstalled this run
             if (w.GameInstalled) return RememberInstalled();
 
-            // Durable evidence for a LATER run: with developer mode off there is no adb,
-            // and the log floor excludes last session's logcat, so a game installed by a
-            // previous run read as "not installed" and burned the whole 30 minutes.
-            if (File.Exists(InstallMarker)) return true;
+            // Durable evidence for a LATER run: with developer mode off there is no adb, and
+            // the log floor excludes last session's logcat, so a game installed by a previous
+            // run read as "not installed" and burned the whole store wait.
+            if (MarkerMatches()) return true;
             return false;
         }
 
@@ -2878,7 +2981,13 @@ namespace GoodPizza
         {
             try
             {
-                if (!File.Exists(InstallMarker)) File.WriteAllText(InstallMarker, GamePackage);
+                var dir = Path.GetDirectoryName(InstallMarker);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                // Rewritten every time rather than only when absent: the userdata stamp is
+                // what makes the record trustworthy, and a record written by an older build
+                // (bare package id) must not outlive the image it described.
+                File.WriteAllText(InstallMarker,
+                    "package=" + GamePackage + "\r\nuserdata=" + (UserDataStamp() ?? "unknown") + "\r\n");
             }
             catch (Exception ex) { Log.Warn("  could not write install marker: " + ex.Message); }
             return true;
@@ -2912,38 +3021,45 @@ namespace GoodPizza
         {
             if (GameInstalled()) { Log.Ok("game already installed"); CheckInstaller(); return true; }
 
-            Log.Info("opening Play Store listing: market://details?id=" + GamePackage);
+            Log.Info("the game is not installed; opening its Play Store listing: market://details?id=" + GamePackage);
             Log.Info("Google sign-in is the user's step - we wait, we never enter credentials");
-            Notice.Show("Action needed",
-                "Sign in to Google, then click Install.\r\n" +
-                "The launcher starts the game when it is ready.");
+            Log.Info("waiting until it is installed (tray > Exit launcher to stop)");
+            // Shown once, when the store is first opened, and never again - not once per
+            // re-submission and not on a timer. Its only job is to explain why the store
+            // opened instead of the game.
+            Notice.Show("One-time setup",
+                "Sign in to Google in the Play Store window, then tap Install.\r\n" +
+                "This message is shown only once; the launcher starts the game by itself.");
             Tray.SetStatus("waiting for Google sign-in + install");
             try
             {
                 var sw = Stopwatch.StartNew();
-                long lastFire = -StoreRefireMs;
-                long lastMin = -1;                 // whole minutes already announced
-                int fired = 0;
                 bool sawWindow = false;
-                var timeoutMs = Cfg.InstallTimeoutMin * 60 * 1000;
+                long lastFire = -StoreRefireMs;
+                long lastLog = -60000;
 
-                while (sw.ElapsedMilliseconds < timeoutMs)
+                // No deadline. A timeout here only ever abandoned a user part-way through a
+                // Google sign-in, and the run had already downloaded three quarters of a
+                // gigabyte to get this far.
+                while (!Cancelled)
                 {
                     var win = AndroidWindowPresent();
-                    if (win && !sawWindow) { sawWindow = true; Log.Ok("Play Store surface visible after " + (sw.ElapsedMilliseconds / 1000) + "s"); Status.Close(); }
-
-                    // Fire at least once, always: on a re-run with an Android window
-                    // already up (the store left open from last run), `win` was true from
-                    // the first iteration, market:// was never submitted, and the user
-                    // was told to tap Install on a page that never opened.
-                    if (fired == 0 || (!win && sw.ElapsedMilliseconds - lastFire >= StoreRefireMs))
+                    if (win && !sawWindow)
                     {
-                        if (!win) Status.Show("Launching the Play Store...");   // already visible: no bubble
+                        sawWindow = true;
+                        Log.Ok("Play Store visible after " + (sw.ElapsedMilliseconds / 1000) + "s");
+                        Status.Close();
+                        Notice.Close();          // it has done its job: the store is on screen
+                    }
+
+                    // Re-submit ONLY when the store failed to come up. Once it is on screen,
+                    // firing market:// again restarts the listing under the user's fingers.
+                    if (!win && sw.ElapsedMilliseconds - lastFire >= StoreRefireMs)
+                    {
+                        if (lastFire >= 0) Log.Info("  the Play Store did not open; submitting the listing again");
                         if (!Open("market://details?id=" + GamePackage))
                             return Fail("Windows could not open the Play Store; re-run the launcher");
-                        fired++;
                         lastFire = sw.ElapsedMilliseconds;
-                        if (fired > 1) Log.Info("  re-submitted store listing (attempt " + fired + ") - sign-in not finished yet?");
                     }
 
                     Wait(3000);
@@ -2954,23 +3070,16 @@ namespace GoodPizza
                         CheckInstaller();
                         return true;
                     }
-                    // One line per whole minute, numbered from the clock. The number is
-                    // derived from elapsed time and only logged when it changes, so the
-                    // sequence can never skip or repeat: the previous form
-                    // (elapsed - lastLog >= 60000, lastLog = elapsed) re-armed the timer
-                    // on a drifting loop, and once the check landed just past a minute
-                    // boundary - measured here at 19 min, then straight to 21 min - the
-                    // skipped minute was gone for good.
+
                     var waitedMin = sw.ElapsedMilliseconds / 60000;
-                    if (waitedMin != lastMin)
+                    if (sw.ElapsedMilliseconds - lastLog >= 60000)
                     {
-                        lastMin = waitedMin;
+                        lastLog = sw.ElapsedMilliseconds;
                         Log.Info("  still waiting for sign-in / install (" + waitedMin + " min)");
                         Tray.SetStatus("waiting for sign-in - " + waitedMin + " min");
                     }
                 }
-                return Fail("the game was not installed within " + Cfg.InstallTimeoutMin +
-                            " minutes (is a Google account signed in?)");
+                return Fail("cancelled while waiting for the game to be installed");
             }
             finally { Notice.Close(); Status.Close(); }
         }

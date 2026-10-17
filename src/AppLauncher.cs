@@ -3059,7 +3059,12 @@ namespace GoodPizza
                         sawWindow = true;
                         Log.Ok("Play Store visible after " + (sw.ElapsedMilliseconds / 1000) + "s");
                         Status.Close();
-                        Notice.Close();          // it has done its job: the store is on screen
+                        // The notice deliberately stays up. Measured on this machine: on an image
+                        // with no Google account signed in, the store's window appears as
+                        // "Loading Play Store" and is gone again within seconds. Closing the
+                        // notice the moment a window first showed therefore dismissed it before
+                        // it could be read - and it is the only thing that explains why the
+                        // store opened instead of the game. It leaves with this step.
                     }
 
                     // Re-submit ONLY when the store failed to come up. Once it is on screen,

@@ -561,7 +561,7 @@ The launcher downloads WSA itself, so a copy of this repo does **not** need to c
 ## Building
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Version 1.1.5
+powershell -ExecutionPolicy Bypass -File tools\build.ps1 -Version 1.1.6
 ```
 
 Output lands in `dist\Good Pizza, Great Pizza.exe` with the icon and the

@@ -70,14 +70,17 @@ Yes/No answer, or a status/progress window — there is no configuration UI to l
 | [`download-prompt.png`](docs/screenshots/download-prompt.png) | The download question: size (0.70 GB), source (with a clickable GitHub link) and install path |
 | [`download-progress.png`](docs/screenshots/download-progress.png) | The download window: MB done / total, a real speed and a time estimate |
 | [`launching-bubble.png`](docs/screenshots/launching-bubble.png) | The "Launching..." bubble: shown while an app is being opened, gone by itself once its window appears |
-| [`waiting-for-sign-in.png`](docs/screenshots/waiting-for-sign-in.png) | The "action needed" notice shown while it waits for **you** to sign in to Google |
+| [`waiting-for-sign-in.png`](docs/screenshots/waiting-for-sign-in.png) | The "one-time setup" notice, shown once while it waits for **you** to sign in and tap Install |
 | [`setup-problem.png`](docs/screenshots/setup-problem.png) | The failure window: which check failed, the cause, a suggested fix and the log |
 | [`exe-icon-256.png`](docs/screenshots/exe-icon-256.png) | The icon embedded in the exe, taken from the Play Store asset |
 
 The prompts are deliberately few-words: one question, two buttons, and the reason in
-plain text. Screens are cropped to the window itself, and captures are only kept after
-the tool confirms the window actually owns the foreground — a screenshot taken a
-millisecond too early shows whatever window happened to be on top instead.
+plain text. Screens are cropped to the window itself, and a capture is only kept once the
+tool can prove the window is really there - a screenshot taken a millisecond too early
+shows whatever window happened to be on top instead. Dialogs that are allowed to take
+focus must own the foreground; the notice and the "Launching..." bubble never take focus
+by design, so they are asked to render themselves instead - other windows' drop shadows
+land on the notice, and the colour in that corner is not the notice's.
 
 ---
 
@@ -515,7 +518,7 @@ Good-pizza-great-pizza/
 │       ├── download-prompt.png        size, source and install path
 │       ├── download-progress.png      MB done, speed, time left
 │       ├── launching-bubble.png        the "Launching..." bubble
-│       ├── waiting-for-sign-in.png    the "action needed" notice
+│       ├── waiting-for-sign-in.png    the "one-time setup" notice
 │       ├── setup-problem.png          the failure window
 │       └── exe-icon-256.png           the icon the exe is built with
 ├── src/

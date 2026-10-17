@@ -16,13 +16,22 @@
       the screen, the run fails loudly instead of silently saving a wrong image.
       A wrong-looking screenshot in the docs is worse than no screenshot.
 
-  * The status bubble deliberately uses ShowWithoutActivation (it must never
-    steal focus from the app it is launching), so it can never pass the
-    foreground test. For such windows pass -NoFocusRequired: the check then
-    becomes "the window owns its own centre pixel" (WindowFromPoint), which is
-    exactly what CopyFromScreen needs to show the window and not something on
-    top of it. Everything else - settle, retries, brightness floor - is
-    unchanged.
+  * The status bubble and the one-time notice deliberately use
+    ShowWithoutActivation (they must never steal focus from the app they are
+    talking about), so they can never pass the foreground test. For them pass
+    -NoFocusRequired: the check becomes "the window owns its own centre pixel"
+    (WindowFromPoint) and the pixels come from PrintWindow rather than the
+    screen.
+      Why PrintWindow (measured 2026-10-17): the notice sits bottom-right, where
+      other windows' drop shadows land on it. Straight CopyFromScreen of that
+      rect averaged 19 and then 151 on two runs of the same window - the centre
+      pixel still belonged to the notice, but its corner did not, and the
+      brightness floor correctly refused to publish either image. PrintWindow on
+      the same handle rendered the notice itself at 223, and is unaffected by
+      what happens to be on top of it.
+      The centre-pixel test stays: it proves the window is genuinely on screen
+      rather than a hidden or stale handle.
+      Everything else - settle, retries, brightness floor - is unchanged.
 
   Exit 0 = captured and verified, 1 = failed.
 #>
@@ -52,6 +61,7 @@ public class Cap {
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
@@ -139,8 +149,26 @@ for ($try = 1; $try -le $Retries; $try++) {
 
     $bmp = New-Object System.Drawing.Bitmap($W, $H)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($r.L, $r.T, 0, 0, (New-Object System.Drawing.Size($W, $H)))
-    $g.Dispose()
+    if ($NoFocusRequired) {
+        # Render the window itself. It can never be brought to the front, and its
+        # corners are routinely covered by other windows' shadows (see header).
+        $hdc = $g.GetHdc()
+        $ok = [Cap]::PrintWindow($hwnd, $hdc, 2)          # 2 = PW_RENDERFULLCONTENT
+        $g.ReleaseHdc($hdc)
+        $g.Dispose()
+        if (-not $ok) {
+            Write-Output "attempt $try : PrintWindow returned FALSE - not capturing"
+            $bmp.Dispose()
+            Start-Sleep -Milliseconds 800
+            continue
+        }
+        $src = 'PrintWindow'
+    }
+    else {
+        $g.CopyFromScreen($r.L, $r.T, 0, 0, (New-Object System.Drawing.Size($W, $H)))
+        $g.Dispose()
+        $src = 'screen'
+    }
 
     $s = Stats $bmp
     # a launcher dialog is light (avg well above mid) with a dark title bar;
@@ -154,7 +182,7 @@ for ($try = 1; $try -le $Retries; $try++) {
 
     $bmp.Save($OutPng, [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
-    Write-Output ("CAPTURED  {0}x{1}  ->  {2}   avg-brightness={3} min={4} max={5}" -f $W, $H, $OutPng, $s.avg, $s.min, $s.max)
+    Write-Output ("CAPTURED  {0}x{1}  ->  {2}   via {3}  avg-brightness={4} min={5} max={6}" -f $W, $H, $OutPng, $src, $s.avg, $s.min, $s.max)
     exit 0
 }
 Write-Output "FAILED  could not capture '$TitlePattern' (pid $ProcId) after $Retries attempts"
